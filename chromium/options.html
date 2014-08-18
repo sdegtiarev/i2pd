@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>I2P Gateway</title>
+    <link href="https://netdna.bootstrapcdn.com/twitter-bootstrap/2.3.2/css/bootstrap-combined.min.css" rel="stylesheet">
+    <style>
+      body {
+        padding-top: 40px;
+        padding-bottom: 40px;
+        background-color: #f5f5f5;
+      }
+      h1 {
+        background: url('/icon/i2p_32.png') no-repeat;
+        padding-left: 58px;
+      }
+      #content {
+        position: relative;
+        margin: 0 auto;
+        width: 800px;
+        background: #fff;
+        padding: 20px;
+        border: 1px solid #e5e5e5;
+        -webkit-border-radius: 5px;
+           -moz-border-radius: 5px;
+                border-radius: 5px;
+        -webkit-box-shadow: 0 1px 2px rgba(0,0,0,.05);
+           -moz-box-shadow: 0 1px 2px rgba(0,0,0,.05);
+                box-shadow: 0 1px 2px rgba(0,0,0,.05);
+      }
+      #alert {
+        display: none;
+        position: absolute;
+        width: 790px;
+        top: -40px;
+        left: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="content">
+      <h1>I2P Gateway</h1>
+
+      <form class="form-inline" id="update">
+        <fieldset>
+          <input type="text" id="addr" placeholder="Address">
+          <input type="text" id="port" placeholder="Port">
+          <button type="button" class="btn" id="save"><i class="icon-plus"></i> Save</button>
+        </fieldset>
+      </form>
+
+
+      <div id="alert" class="alert fade in alert-success">
+        <span class="msg"></span>
+      </div>
+  </body>
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script>
+  <script src="https://netdna.bootstrapcdn.com/twitter-bootstrap/2.3.2/js/bootstrap.min.js"></script>
+  <script src="options.js"></script>
+
+</html>
