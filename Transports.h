@@ -26,6 +26,7 @@ namespace i2p
 			void Start ();
 			void Stop ();
 			i2p::data::DHKeysPair * Acquire ();
+			void Return (i2p::data::DHKeysPair * pair);
 
 		private:
 
@@ -34,7 +35,7 @@ namespace i2p
 
 		private:
 
-			int m_QueueSize;
+			const int m_QueueSize;
 			std::queue<i2p::data::DHKeysPair *> m_Queue;
 
 			bool m_IsRunning;
@@ -55,6 +56,7 @@ namespace i2p
 			
 			boost::asio::io_service& GetService () { return m_Service; };
 			i2p::data::DHKeysPair * GetNextDHKeysPair ();	
+			void ReuseDHKeysPair (i2p::data::DHKeysPair * pair);
 
 			void AddNTCPSession (i2p::ntcp::NTCPSession * session);
 			void RemoveNTCPSession (i2p::ntcp::NTCPSession * session);
@@ -69,6 +71,8 @@ namespace i2p
 
 			void Run ();
 			void HandleAccept (i2p::ntcp::NTCPServerConnection * conn, const boost::system::error_code& error);
+			void HandleResendTimer (const boost::system::error_code& ecode, boost::asio::deadline_timer * timer,
+				const i2p::data::IdentHash& ident, i2p::I2NPMessage * msg);
 			void PostMessage (const i2p::data::IdentHash& ident, i2p::I2NPMessage * msg);
 			void PostCloseSession (const i2p::data::RouterInfo * router);
 			

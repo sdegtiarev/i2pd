@@ -11,6 +11,7 @@ namespace i2p
 {
 namespace util
 {
+	const size_t HTTP_CONNECTION_BUFFER_SIZE = 8192;	
 	class HTTPConnection
 	{
 		protected:
@@ -41,7 +42,8 @@ namespace util
 
 		public:
 
-			HTTPConnection (boost::asio::ip::tcp::socket * socket): m_Socket (socket), m_Stream (nullptr) { Receive (); };
+			HTTPConnection (boost::asio::ip::tcp::socket * socket): 
+				m_Socket (socket), m_Stream (nullptr), m_BufferLen (0) { Receive (); };
 			virtual ~HTTPConnection() { delete m_Socket; }
 
 		private:
@@ -55,32 +57,40 @@ namespace util
 			void HandleWrite (const boost::system::error_code& ecode);
 			void SendReply (const std::string& content, int status = 200);
 
-			void HandleRequest ();
+			void HandleRequest (const std::string& address);
+			void HandleCommand (const std::string& command, std::stringstream& s);
+			void ShowTransports (std::stringstream& s);
+			void ShowTunnels (std::stringstream& s);
+			void ShowTransitTunnels (std::stringstream& s);
+			void ShowLocalDestinations (std::stringstream& s);
+			void ShowLocalDestination (const std::string& b32, std::stringstream& s);
+			void StartAcceptingTunnels (std::stringstream& s);
+			void StopAcceptingTunnels (std::stringstream& s);
 			void FillContent (std::stringstream& s);
 			std::string ExtractAddress ();
-
-			// for eepsite
-			void EepAccept (i2p::stream::StreamingDestination * destination);
-			void HandleEepAccept (i2p::stream::Stream * stream);
+			void ExtractParams (const std::string& str, std::map<std::string, std::string>& params);
+			
 			
 		protected:
 
 			boost::asio::ip::tcp::socket * m_Socket;
 			i2p::stream::Stream * m_Stream;
-			char m_Buffer[8192], m_StreamBuffer[8192];
+			char m_Buffer[HTTP_CONNECTION_BUFFER_SIZE + 1], m_StreamBuffer[HTTP_CONNECTION_BUFFER_SIZE + 1];
+			size_t m_BufferLen;
 			request m_Request;
 			reply m_Reply;
 
 		protected:
-
-
-			virtual void HandleDestinationRequest(const std::string& address, const std::string& uri);
-			virtual void HandleDestinationRequest(const std::string& address, const std::string& method, const std::string& data, const std::string& uri);
+	
 			virtual void RunRequest ();
+			void HandleDestinationRequest(const std::string& address, const std::string& uri);
+			void SendToAddress (const std::string& address, const char * buf, size_t len);
+			void SendToDestination (const i2p::data::IdentHash& destination, const char * buf, size_t len);
 
 		public:
 
 			static const std::string itoopieImage;
+			static const std::string itoopieFavicon;
 	};
 
 	class HTTPServer
@@ -110,24 +120,6 @@ namespace util
 		protected:
 			virtual void CreateConnection(boost::asio::ip::tcp::socket * m_NewSocket);
 	};
-
-	// TODO: move away
-	class EepSiteDummyConnection
-	{
-		public:
-
-			EepSiteDummyConnection (i2p::stream::Stream * stream): m_Stream (stream) {};
-			void AsyncStreamReceive ();
-			
-		private:
-
-			void HandleStreamReceive (const boost::system::error_code& ecode, std::size_t bytes_transferred);
-			
-		private:
-
-			i2p::stream::Stream * m_Stream;
-			char m_StreamBuffer[8192];
-	};	
 }
 }
 

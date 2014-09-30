@@ -12,7 +12,20 @@
 namespace i2p
 {
 namespace data
-{			
+{
+	const char CAPS_FLAG_FLOODFILL = 'f';
+	const char CAPS_FLAG_HIDDEN = 'H';
+	const char CAPS_FLAG_REACHABLE = 'R';
+	const char CAPS_FLAG_UNREACHABLE = 'U';	
+	const char CAPS_FLAG_LOW_BANDWIDTH1 = 'K';		
+	const char CAPS_FLAG_LOW_BANDWIDTH2 = 'L';	
+	const char CAPS_FLAG_HIGH_BANDWIDTH1 = 'M';	
+	const char CAPS_FLAG_HIGH_BANDWIDTH2 = 'N';
+	const char CAPS_FLAG_HIGH_BANDWIDTH3 = 'O';
+
+	const char CAPS_FLAG_SSU_TESTING = 'B';
+	const char CAPS_FLAG_SSU_INTRODUCER = 'C';
+
 	const int MAX_RI_BUFFER_SIZE = 2048;
 	class RouterInfo: public RoutingDestination
 	{
@@ -33,7 +46,8 @@ namespace data
 				eReachable = 0x04,
 				eSSUTesting = 0x08,
 				eSSUIntroducer = 0x10,
-				eHidden = 0x20
+				eHidden = 0x20,
+				eUnreachable = 0x40
 			};
 
 			enum TransportStyle
@@ -47,7 +61,7 @@ namespace data
 			{
 				boost::asio::ip::address iHost;
 				int iPort;
-				uint8_t iKey[32];
+				Tag<32> iKey;
 				uint32_t iTag;
 			};
 
@@ -55,11 +69,11 @@ namespace data
 			{
 				TransportStyle transportStyle;
 				boost::asio::ip::address host;
-				int port;
+				int port, mtu;
 				uint64_t date;
 				uint8_t cost;
 				// SSU only
-				uint8_t key[32]; // intro key for SSU
+				Tag<32> key; // intro key for SSU
 				std::vector<Introducer> introducers;
 			};
 			
@@ -82,6 +96,8 @@ namespace data
 			
 			void AddNTCPAddress (const char * host, int port);
 			void AddSSUAddress (const char * host, int port, const uint8_t * key);
+			bool AddIntroducer (const Address * address, uint32_t tag);
+			bool RemoveIntroducer (const boost::asio::ip::udp::endpoint& e);
 			void SetProperty (const char * key, const char * value);
 			const char * GetProperty (const char * key) const;
 			bool IsFloodfill () const;
@@ -93,7 +109,9 @@ namespace data
 			bool IsPeerTesting () const { return m_Caps & eSSUTesting; };
 			bool IsHidden () const { return m_Caps & eHidden; };
 
-			uint8_t GetCaps () const { return m_Caps; };			
+			uint8_t GetCaps () const { return m_Caps; };	
+			void SetCaps (uint8_t caps);
+			void SetCaps (const char * caps);
 
 			void SetUnreachable (bool unreachable) { m_IsUnreachable = unreachable; }; 
 			bool IsUnreachable () const { return m_IsUnreachable; };
@@ -102,7 +120,7 @@ namespace data
 			const uint8_t * LoadBuffer (); // load if necessary
 			int GetBufferLen () const { return m_BufferLen; };			
 
-			void CreateBuffer ();
+			void CreateBuffer (const PrivateKeys& privateKeys);
 			void UpdateRoutingKey ();
 
 			bool IsUpdated () const { return m_IsUpdated; };
@@ -130,7 +148,8 @@ namespace data
 			void ExtractCaps (const char * value);
 			void UpdateIdentHashBase64 ();
 			const Address * GetAddress (TransportStyle s, bool v4only) const;
-			
+			void UpdateCapsProperty ();			
+
 		private:
 
 			std::string m_FullPath;

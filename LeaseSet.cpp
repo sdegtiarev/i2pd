@@ -22,17 +22,18 @@ namespace data
 
 	LeaseSet::LeaseSet (const i2p::tunnel::TunnelPool& pool):
 		m_IsUnsolicited (false)
-	{
-		m_BufferLen = 0;	
+	{	
 		// header
 		const i2p::data::LocalDestination& localDestination = pool.GetLocalDestination ();
-		LeaseSetHeader * header = (LeaseSetHeader *)m_Buffer;
-		header->destination = localDestination.GetIdentity ();
-		memcpy (header->encryptionKey, localDestination.GetEncryptionPublicKey (), 256);
-		memset (header->signingKey, 0, 128);
+		m_BufferLen = localDestination.GetIdentity ().ToBuffer (m_Buffer, MAX_LS_BUFFER_SIZE);
+		memcpy (m_Buffer + m_BufferLen, localDestination.GetEncryptionPublicKey (), 256);
+		m_BufferLen += 256;
+		auto signingKeyLen = localDestination.GetIdentity ().GetSigningPublicKeyLen ();
+		memset (m_Buffer + m_BufferLen, 0, signingKeyLen);
+		m_BufferLen += signingKeyLen;
 		auto tunnels = pool.GetInboundTunnels (5); // 5 tunnels maximum
-		header->num = tunnels.size (); // num leases
-		m_BufferLen += sizeof (LeaseSetHeader);	
+		m_Buffer[m_BufferLen] = tunnels.size (); // num leases
+		m_BufferLen++;
 		// leases
 		for (auto it: tunnels)
 		{	
@@ -46,7 +47,7 @@ namespace data
 		}	
 		// signature
 		localDestination.Sign (m_Buffer, m_BufferLen, m_Buffer + m_BufferLen);
-		m_BufferLen += 40;
+		m_BufferLen += localDestination.GetIdentity ().GetSignatureLen (); 
 		LogPrint ("Local LeaseSet of ", tunnels.size (), " leases created");
 
 		ReadFromBuffer ();
@@ -62,15 +63,17 @@ namespace data
 	
 	void LeaseSet::ReadFromBuffer ()	
 	{	
-		const LeaseSetHeader * header = (const LeaseSetHeader *)m_Buffer;
-		m_Identity = header->destination;
-		m_IdentHash = m_Identity.Hash();
-		memcpy (m_EncryptionKey, header->encryptionKey, 256);
-		LogPrint ("LeaseSet num=", (int)header->num);
+		size_t size = m_Identity.FromBuffer (m_Buffer, m_BufferLen);
+		memcpy (m_EncryptionKey, m_Buffer + size, 256);
+		size += 256; // encryption key
+		size += m_Identity.GetSigningPublicKeyLen (); // unused signing key
+		uint8_t num = m_Buffer[size];
+		size++; // num
+		LogPrint ("LeaseSet num=", (int)num);
 
 		// process leases
-		const uint8_t * leases = m_Buffer + sizeof (LeaseSetHeader);
-		for (int i = 0; i < header->num; i++)
+		const uint8_t * leases = m_Buffer + size;
+		for (int i = 0; i < num; i++)
 		{
 			Lease lease = *(Lease *)leases;
 			lease.tunnelID = be32toh (lease.tunnelID);
@@ -88,11 +91,7 @@ namespace data
 		}	
 		
 		// verify
-		CryptoPP::DSA::PublicKey pubKey;
-		pubKey.Initialize (i2p::crypto::dsap, i2p::crypto::dsaq, i2p::crypto::dsag, 
-			CryptoPP::Integer (m_Identity.signingKey, 128));
-		CryptoPP::DSA::Verifier verifier (pubKey);
-		if (!verifier.VerifyMessage (m_Buffer, leases - m_Buffer, leases, 40))
+		if (!m_Identity.Verify (m_Buffer, leases - m_Buffer, leases))
 			LogPrint ("LeaseSet verification failed");
 	}				
 	

@@ -166,18 +166,21 @@ namespace data
 		ps = (unsigned char *)InBuffer;
 		
 		if (outCount > len) return -1;
-		pd = (unsigned char *)OutBuffer;
+		pd = OutBuffer;
+		auto endOfOutBuffer = OutBuffer + outCount;		
 		for ( i = 0; i < n; i++ ){
 		     acc_1 = iT64[*ps++];
 		     acc_2 = iT64[*ps++];
 		     acc_1 <<= 2;
 		     acc_1 |= acc_2>>4;
 		     *pd++  = acc_1;
+			 if (pd >= endOfOutBuffer) break;
 
 		     acc_2 <<= 4;
 		     acc_1 = iT64[*ps++];
 		     acc_2 |= acc_1 >> 2;
 		     *pd++ = acc_2;
+			  if (pd >= endOfOutBuffer) break;	
 
 		     acc_2 = iT64[*ps++];
 		     acc_2 |= acc_1 << 6;
@@ -229,6 +232,36 @@ namespace data
 				ret++;
 			}
 			tmp <<= 5;
+		}
+		return ret;
+	}
+
+	size_t ByteStreamToBase32 (const uint8_t * inBuf, size_t len, char * outBuf, size_t outLen)
+	{
+		size_t ret = 0, pos = 1;
+		int bits = 8, tmp = inBuf[0];
+		while (ret < outLen && (bits > 0 || pos < len))
+		{ 	
+			if (bits < 5)
+			{
+				if (pos < len)
+				{
+					tmp <<= 8;
+		      		tmp |= inBuf[pos] & 0xFF;
+					pos++;
+		      		bits += 8;
+				}
+				else // last byte
+				{
+					tmp <<= (5 - bits);
+				  	bits = 5;
+				}
+			}	
+		
+			bits -= 5;
+			int ind = (tmp >> bits) & 0x1F;
+			outBuf[ret] = (ind < 26) ? (ind + 'a') : ((ind - 26) + '2');
+			ret++;
 		}
 		return ret;
 	}

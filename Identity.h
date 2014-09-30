@@ -6,6 +6,7 @@
 #include <string>
 #include "base64.h"
 #include "ElGamal.h"
+#include "Signature.h"
 
 namespace i2p
 {
@@ -45,6 +46,14 @@ namespace data
 				return std::string (str);
 			}
 
+			std::string ToBase32 () const
+			{
+				char str[sz*2];
+				int l = i2p::data::ByteStreamToBase32 (m_Buf, sz, str, sz*2);
+				str[l] = 0;
+				return std::string (str);
+			}
+
 		private:
 
 			union // 8 bytes alignment
@@ -79,7 +88,6 @@ namespace data
 	const uint8_t CERTIFICATE_TYPE_MULTIPLE = 4;	
 	const uint8_t CERTIFICATE_TYPE_KEY = 5;
 
-	const size_t DEFAULT_IDENTITY_SIZE = 387;
 	struct Identity
 	{
 		uint8_t publicKey[256];
@@ -90,23 +98,88 @@ namespace data
 			uint16_t length;
 		} certificate;	
 
+		Identity () = default;
+		Identity (const Keys& keys) { *this = keys; };
 		Identity& operator=(const Keys& keys);
-		bool FromBase64(const std::string& );
 		size_t FromBuffer (const uint8_t * buf, size_t len);
-		IdentHash Hash() const;
+		IdentHash Hash () const;
+	};	
+	const size_t DEFAULT_IDENTITY_SIZE = sizeof (Identity); // 387 bytes
+
+	const uint16_t CRYPTO_KEY_TYPE_ELGAMAL = 0;
+	const uint16_t SIGNING_KEY_TYPE_DSA_SHA1 = 0;
+	const uint16_t SIGNING_KEY_TYPE_ECDSA_SHA256_P256 = 1;
+	typedef uint16_t SigningKeyType;
+	
+	class IdentityEx
+	{
+		public:
+
+			IdentityEx ();
+			IdentityEx (const uint8_t * publicKey, const uint8_t * signingKey,
+				SigningKeyType type = SIGNING_KEY_TYPE_DSA_SHA1);
+			IdentityEx (const uint8_t * buf, size_t len);
+			IdentityEx (const IdentityEx& other);
+			~IdentityEx ();
+			IdentityEx& operator=(const IdentityEx& other);
+			IdentityEx& operator=(const Identity& standard);
+
+			size_t FromBase64(const std::string& s);
+			size_t FromBuffer (const uint8_t * buf, size_t len);
+			size_t ToBuffer (uint8_t * buf, size_t len) const;
+			const Identity& GetStandardIdentity () const { return m_StandardIdentity; };
+			const IdentHash& GetIdentHash () const { return m_IdentHash; };
+			size_t GetFullLen () const { return m_ExtendedLen + DEFAULT_IDENTITY_SIZE; };
+			size_t GetSigningPublicKeyLen () const;
+			size_t GetSignatureLen () const;
+			bool Verify (const uint8_t * buf, size_t len, const uint8_t * signature) const;
+			SigningKeyType GetSigningKeyType () const;
+			
+		private:
+
+			void CreateVerifier ();
+			
+		private:
+
+			Identity m_StandardIdentity;
+			IdentHash m_IdentHash;
+			i2p::crypto::Verifier * m_Verifier;
+			size_t m_ExtendedLen;
+			uint8_t * m_ExtendedBuffer;
 	};	
 	
-	struct PrivateKeys // for eepsites
+	class PrivateKeys // for eepsites
 	{
-		Identity pub;
-		uint8_t privateKey[256];
-		uint8_t signingPrivateKey[20];	
+		public:
+			
+			PrivateKeys (): m_Signer (nullptr) {};
+			PrivateKeys (const PrivateKeys& other): m_Signer (nullptr) { *this = other; };
+			PrivateKeys (const Keys& keys): m_Signer (nullptr) { *this = keys; };
+			PrivateKeys& operator=(const Keys& keys);
+			PrivateKeys& operator=(const PrivateKeys& other);
+			~PrivateKeys () { delete m_Signer; };
+			
+			const IdentityEx& GetPublic () const { return m_Public; };
+			const uint8_t * GetPrivateKey () const { return m_PrivateKey; };
+			const uint8_t * GetSigningPrivateKey () const { return m_SigningPrivateKey; };
+			void Sign (const uint8_t * buf, int len, uint8_t * signature) const;
 
-		PrivateKeys () = default;
-		PrivateKeys (const PrivateKeys& ) = default;
-		PrivateKeys (const Keys& keys) { *this = keys; };
-		
-		PrivateKeys& operator=(const Keys& keys);
+			size_t GetFullLen () const { return m_Public.GetFullLen () + 256 + m_Public.GetSignatureLen ()/2; };			
+			size_t FromBuffer (const uint8_t * buf, size_t len);
+			size_t ToBuffer (uint8_t * buf, size_t len) const;
+
+			static PrivateKeys CreateRandomKeys (SigningKeyType type = SIGNING_KEY_TYPE_DSA_SHA1);
+	
+		private:
+
+			void CreateSigner ();
+			
+		private:
+
+			IdentityEx m_Public;
+			uint8_t m_PrivateKey[256];
+			uint8_t m_SigningPrivateKey[128]; // assume private key doesn't exceed 128 bytes
+			i2p::crypto::Signer * m_Signer;
 	};
 	
 #pragma pack()
@@ -166,12 +239,17 @@ namespace data
 		public:
 
 			virtual ~LocalDestination() {};
-			virtual const IdentHash& GetIdentHash () const = 0;
-			virtual const Identity& GetIdentity () const = 0;
+			virtual const PrivateKeys& GetPrivateKeys () const = 0;
 			virtual const uint8_t * GetEncryptionPrivateKey () const = 0; 
 			virtual const uint8_t * GetEncryptionPublicKey () const = 0; 
-			virtual void Sign (const uint8_t * buf, int len, uint8_t * signature) const = 0;
 			virtual void SetLeaseSetUpdated () = 0;
+
+			const IdentityEx& GetIdentity () const { return GetPrivateKeys ().GetPublic (); };
+			const IdentHash& GetIdentHash () const { return GetIdentity ().GetIdentHash (); };  
+			void Sign (const uint8_t * buf, int len, uint8_t * signature) const 
+			{ 
+				GetPrivateKeys ().Sign (buf, len, signature); 
+			};
 	};	
 }
 }

@@ -15,7 +15,7 @@ namespace i2p
 namespace garlic
 {	
 	GarlicRoutingSession::GarlicRoutingSession (const i2p::data::RoutingDestination * destination, int numTags):
-		m_Destination (destination), m_FirstMsgID (0), m_IsAcknowledged (false), m_NumTags (numTags), 
+		m_Destination (destination), m_IsAcknowledged (false), m_NumTags (numTags), 
 		m_NextTag (-1), m_SessionTags (0), m_TagsCreationTime (0), m_LocalLeaseSet (nullptr)	
 	{
 		// create new session tags and session key
@@ -31,7 +31,7 @@ namespace garlic
 	}	
 
 	GarlicRoutingSession::GarlicRoutingSession (const uint8_t * sessionKey, const SessionTag& sessionTag):
-		m_Destination (nullptr), m_FirstMsgID (0), m_IsAcknowledged (true), m_NumTags (1), m_NextTag (0),
+		m_Destination (nullptr), m_IsAcknowledged (true), m_NumTags (1), m_NextTag (0),
 		m_LocalLeaseSet (nullptr)	
 	{
 		memcpy (m_SessionKey, sessionKey, 32);
@@ -175,7 +175,7 @@ namespace garlic
 				if (size > 0) // successive?
 				{
 					(*numCloves)++;
-					m_FirstMsgID = msgID;
+					routing.DeliveryStatusSent (this, msgID);
 				}
 				else
 					LogPrint ("DeliveryStatus clove was not created");
@@ -290,25 +290,12 @@ namespace garlic
 		SessionDecryption * decryption = new SessionDecryption;
 		decryption->SetKey (key);
 		decryption->SetTagCount (1);
+		std::unique_lock<std::mutex> l(m_SessionsTagsMutex);
 		m_SessionTags[SessionTag(tag)] = decryption;
 	}	
-		
-	I2NPMessage * GarlicRouting::WrapSingleMessage (const i2p::data::RoutingDestination& destination, I2NPMessage * msg)
-	{
-		auto it = m_Sessions.find (destination.GetIdentHash ());
-		if (it != m_Sessions.end ())
-		{
-			delete it->second;
-			m_Sessions.erase (it);
-		}
-		GarlicRoutingSession * session = new GarlicRoutingSession (&destination, 0); // not follow-on messages expected
-		m_Sessions[destination.GetIdentHash ()] = session;
 
-		return session->WrapSingleMessage (msg, nullptr);
-	}	
-
-	I2NPMessage * GarlicRouting::WrapMessage (const i2p::data::RoutingDestination& destination, 
-		I2NPMessage * msg, const i2p::data::LeaseSet * leaseSet)
+	GarlicRoutingSession * GarlicRouting::GetRoutingSession (
+		const i2p::data::RoutingDestination& destination, int numTags)
 	{
 		auto it = m_Sessions.find (destination.GetIdentHash ());
 		GarlicRoutingSession * session = nullptr;
@@ -316,15 +303,30 @@ namespace garlic
 			session = it->second;
 		if (!session)
 		{
-			session = new GarlicRoutingSession (&destination, 32); 
+			session = new GarlicRoutingSession (&destination, numTags); 
+			std::unique_lock<std::mutex> l(m_SessionsMutex);
 			m_Sessions[destination.GetIdentHash ()] = session;
 		}	
+		return session;
+	}	
+		
+	I2NPMessage * GarlicRouting::WrapSingleMessage (const i2p::data::RoutingDestination& destination, I2NPMessage * msg)
+	{
+		return WrapMessage (destination, msg, nullptr);
+	}	
 
-		I2NPMessage * ret = session->WrapSingleMessage (msg, leaseSet);
-		if (!session->GetNextTag ()) // tags have beed recreated
-			m_CreatedSessions[session->GetFirstMsgID ()] = session;
-		return ret;
+	I2NPMessage * GarlicRouting::WrapMessage (const i2p::data::RoutingDestination& destination, 
+		I2NPMessage * msg, const i2p::data::LeaseSet * leaseSet)
+	{
+		auto session = GetRoutingSession (destination, leaseSet ? 32 : 0); // don't use tag if no LeaseSet
+		return session->WrapSingleMessage (msg, leaseSet);
 	}
+
+	void GarlicRouting::DeliveryStatusSent (GarlicRoutingSession * session, uint32_t msgID)
+	{
+		std::unique_lock<std::mutex> l(m_CreatedSessionsMutex);
+		m_CreatedSessions[msgID] = session;
+	}	
 		
 	void GarlicRouting::HandleGarlicMessage (I2NPMessage * msg)
 	{
@@ -342,6 +344,7 @@ namespace garlic
 			it->second->UseTag ();
 			HandleAESBlock (buf + 32, length - 32, it->second, msg->from);
 			if (!it->second->GetTagCount ()) delete it->second; // all tags were used
+			std::unique_lock<std::mutex> l(m_SessionsTagsMutex);
 			m_SessionTags.erase (it); // tag might be used only once
 		}
 		else
@@ -376,6 +379,7 @@ namespace garlic
 		if (tagCount > 0)
 		{	
 			decryption->AddTagCount (tagCount);
+			std::unique_lock<std::mutex> l(m_SessionsTagsMutex);
 			for (int i = 0; i < tagCount; i++)
 				m_SessionTags[SessionTag(buf + i*32)] = decryption;	
 		}	
@@ -425,7 +429,7 @@ namespace garlic
 			{
 				case eGarlicDeliveryTypeLocal:
 					LogPrint ("Garlic type local");
-					i2p::HandleI2NPMessage (CreateI2NPMessage (buf, GetI2NPMessageLength (buf)));
+					i2p::HandleI2NPMessage (CreateI2NPMessage (buf, GetI2NPMessageLength (buf), from));
 				break;	
 				case eGarlicDeliveryTypeDestination:
 				{	
@@ -454,7 +458,7 @@ namespace garlic
 						tunnel = from->GetTunnelPool ()->GetNextOutboundTunnel ();
 					if (tunnel) // we have send it through an outbound tunnel
 					{	
-						I2NPMessage * msg = CreateI2NPMessage (buf, GetI2NPMessageLength (buf));
+						I2NPMessage * msg = CreateI2NPMessage (buf, GetI2NPMessageLength (buf), from);
 						tunnel->SendTunnelDataMsg (gwHash, gwTunnel, msg);
 					}	
 					else
@@ -479,12 +483,15 @@ namespace garlic
 	{
 		I2NPDeliveryStatusMsg * deliveryStatus = (I2NPDeliveryStatusMsg *)msg->GetPayload ();
 		uint32_t msgID = be32toh (deliveryStatus->msgID);
-		auto it = m_CreatedSessions.find (msgID);
-		if (it != m_CreatedSessions.end ())			
 		{
-			it->second->SetAcknowledged (true);
-			m_CreatedSessions.erase (it);
-			LogPrint ("Garlic message ", msgID, " acknowledged");
+			std::unique_lock<std::mutex> l(m_CreatedSessionsMutex);
+			auto it = m_CreatedSessions.find (msgID);
+			if (it != m_CreatedSessions.end ())			
+			{
+				it->second->SetAcknowledged (true);
+				m_CreatedSessions.erase (it);
+				LogPrint ("Garlic message ", msgID, " acknowledged");
+			}	
 		}	
 		DeleteI2NPMessage (msg);	
 	}	

@@ -32,6 +32,14 @@ namespace data
 		return nullptr;	
 	}
 
+	void AddressBook::InsertAddress (const std::string& address, const std::string& base64)
+	{
+		IdentityEx ident;
+		ident.FromBase64 (base64);
+		m_Addresses[address] = ident.GetIdentHash ();
+		LogPrint (address,"->",ident.GetIdentHash ().ToBase32 (), ".b32.i2p added");
+	}
+
 	void AddressBook::LoadHostsFromI2P ()
 	{
 		std::string content;
@@ -87,13 +95,9 @@ namespace data
 				std::string name = s.substr(0, pos++);
 				std::string addr = s.substr(pos);
 
-				Identity ident;
-				if (!ident.FromBase64(addr)) 
-				{
-					LogPrint ("hosts.txt: ignore ", name);
-					continue;
-				}
-				m_Addresses[name] = ident.Hash();
+				IdentityEx ident;
+				ident.FromBase64(addr);
+				m_Addresses[name] = ident.GetIdentHash ();
 				numAddresses++;
 			}		
 		}

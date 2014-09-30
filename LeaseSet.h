@@ -34,14 +34,6 @@ namespace data
 		}	
 	};	
 	
-	struct LeaseSetHeader
-	{
-		Identity destination;
-		uint8_t encryptionKey[256];
-		uint8_t signingKey[128];
-		uint8_t num;
-	};	
-	
 #pragma pack()	
 
 	const int MAX_LS_BUFFER_SIZE = 2048;	
@@ -62,8 +54,8 @@ namespace data
 			void SetUnsolicited (bool unsolicited) { m_IsUnsolicited = unsolicited; };
 
 			// implements RoutingDestination
-			const Identity& GetIdentity () const { return m_Identity; };
-			const IdentHash& GetIdentHash () const { return m_IdentHash; };
+			const Identity& GetIdentity () const { return m_Identity.GetStandardIdentity (); };
+			const IdentHash& GetIdentHash () const { return m_Identity.GetIdentHash (); };
 			const std::vector<Lease>& GetLeases () const { return m_Leases; };
 			const std::vector<Lease> GetNonExpiredLeases () const;
 			bool HasExpiredLeases () const;
@@ -78,8 +70,7 @@ namespace data
 		private:
 
 			std::vector<Lease> m_Leases;
-			Identity m_Identity;
-			IdentHash m_IdentHash;
+			IdentityEx m_Identity;
 			uint8_t m_EncryptionKey[256];
 			uint8_t m_Buffer[MAX_LS_BUFFER_SIZE];
 			size_t m_BufferLen;

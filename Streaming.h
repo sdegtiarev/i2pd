@@ -16,6 +16,7 @@
 #include "LeaseSet.h"
 #include "I2NPProtocol.h"
 #include "TunnelPool.h"
+#include "Garlic.h"
 
 namespace i2p
 {
@@ -85,6 +86,7 @@ namespace stream
 			uint32_t GetSendStreamID () const { return m_SendStreamID; };
 			uint32_t GetRecvStreamID () const { return m_RecvStreamID; };
 			const i2p::data::LeaseSet * GetRemoteLeaseSet () const { return m_RemoteLeaseSet; };
+			const i2p::data::IdentityEx& GetRemoteIdentity () const { return m_RemoteIdentity; };
 			bool IsOpen () const { return m_IsOpen; };
 			bool IsEstablished () const { return m_SendStreamID; };
 			StreamingDestination * GetLocalDestination () { return m_LocalDestination; };
@@ -125,8 +127,9 @@ namespace stream
 			int32_t m_LastReceivedSequenceNumber;
 			bool m_IsOpen, m_LeaseSetUpdated;
 			StreamingDestination * m_LocalDestination;
-			i2p::data::Identity m_RemoteIdentity;
+			i2p::data::IdentityEx m_RemoteIdentity;
 			const i2p::data::LeaseSet * m_RemoteLeaseSet;
+			i2p::garlic::GarlicRoutingSession * m_RoutingSession;
 			i2p::data::Lease m_CurrentRemoteLease;
 			i2p::tunnel::OutboundTunnel * m_CurrentOutboundTunnel;
 			std::queue<Packet *> m_ReceiveQueue;
@@ -139,25 +142,25 @@ namespace stream
 	{
 		public:
 
-			StreamingDestination (boost::asio::io_service& service);
+			StreamingDestination (boost::asio::io_service& service, bool isPublic);
 			StreamingDestination (boost::asio::io_service& service, const std::string& fullPath);
+			StreamingDestination (boost::asio::io_service& service, const i2p::data::PrivateKeys& keys, bool isPublic);
 			~StreamingDestination ();	
 
-			const i2p::data::PrivateKeys& GetKeys () const { return m_Keys; };
 			const i2p::data::LeaseSet * GetLeaseSet ();
 			i2p::tunnel::TunnelPool * GetTunnelPool () const  { return m_Pool; };			
 
 			Stream * CreateNewOutgoingStream (const i2p::data::LeaseSet& remote);
 			void DeleteStream (Stream * stream);			
 			void SetAcceptor (const std::function<void (Stream *)>& acceptor) { m_Acceptor = acceptor; };
+			void ResetAcceptor () { m_Acceptor = nullptr; };
+			bool IsAcceptorSet () const { return m_Acceptor != nullptr; };	
 			void HandleNextPacket (Packet * packet);
 
 			// implements LocalDestination
-			const i2p::data::IdentHash& GetIdentHash () const { return m_IdentHash; };
-			const i2p::data::Identity& GetIdentity () const { return m_Keys.pub; };
+			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };
 			const uint8_t * GetEncryptionPrivateKey () const { return m_EncryptionPrivateKey; };
 			const uint8_t * GetEncryptionPublicKey () const { return m_EncryptionPublicKey; };
-			void Sign (const uint8_t * buf, int len, uint8_t * signature) const;
 			void SetLeaseSetUpdated ();
 
 		private:		
@@ -170,13 +173,12 @@ namespace stream
 			boost::asio::io_service& m_Service;
 			std::map<uint32_t, Stream *> m_Streams;
 			i2p::data::PrivateKeys m_Keys;
-			i2p::data::IdentHash m_IdentHash;
 			uint8_t m_EncryptionPublicKey[256], m_EncryptionPrivateKey[256];
 			
 			i2p::tunnel::TunnelPool * m_Pool;
 			i2p::data::LeaseSet * m_LeaseSet;
-			
-			CryptoPP::DSA::PrivateKey m_SigningPrivateKey;
+			bool m_IsPublic;			
+
 			std::function<void (Stream *)> m_Acceptor;
 	};	
 
@@ -196,7 +198,12 @@ namespace stream
 			Stream * CreateClientStream (const i2p::data::LeaseSet& remote);
 			void DeleteStream (Stream * stream);
 			StreamingDestination * GetSharedLocalDestination () const { return m_SharedLocalDestination; };
-			
+			StreamingDestination * CreateNewLocalDestination (bool isPublic);
+			void DeleteLocalDestination (StreamingDestination * destination);
+			StreamingDestination * GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic);
+			StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination) const;		
+			StreamingDestination * LoadLocalDestination (const std::string& filename);
+
 		private:	
 
 			void Run ();
@@ -212,6 +219,10 @@ namespace stream
 
 			std::map<i2p::data::IdentHash, StreamingDestination *> m_Destinations;
 			StreamingDestination * m_SharedLocalDestination;	
+
+		public:
+			// for HTTP
+			const decltype(m_Destinations)& GetDestinations () const { return m_Destinations; };
 	};	
 	
 	Stream * CreateStream (const i2p::data::LeaseSet& remote);
@@ -219,6 +230,13 @@ namespace stream
 	void StartStreaming ();
 	void StopStreaming ();
 	StreamingDestination * GetSharedLocalDestination ();
+	StreamingDestination * CreateNewLocalDestination (bool isPublic = true);
+	void DeleteLocalDestination (StreamingDestination * destination);
+	StreamingDestination * GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic = true);
+	StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination);	
+	StreamingDestination * LoadLocalDestination (const std::string& filename);
+	// for HTTP
+	const StreamingDestinations& GetLocalDestinations ();	
 	
 	// assuming data is I2CP message
 	void HandleDataMessage (i2p::data::IdentHash destination, const uint8_t * buf, size_t len);

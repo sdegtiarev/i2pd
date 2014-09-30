@@ -105,9 +105,6 @@
     <ClCompile Include="..\Daemon.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\DaemonLinux.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\DaemonWin32.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -118,6 +115,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\aes.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\I2PTunnel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\SAM.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -229,6 +232,18 @@
     </ClInclude>
     <ClInclude Include="..\SSUData.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\I2PTunnel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\version.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Signature.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\SAM.h">
+      <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

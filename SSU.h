@@ -33,6 +33,9 @@ namespace ssu
 
 	const int SSU_CONNECT_TIMEOUT = 5; // 5 seconds
 	const int SSU_TERMINATION_TIMEOUT = 330; // 5.5 minutes
+	const int SSU_KEEP_ALIVE_INTERVAL = 30; // 30 seconds	
+	const int SSU_TO_INTRODUCER_SESSION_DURATION = 3600; // 1 hour
+	const size_t SSU_MAX_NUM_INTRODUCERS = 3;
 
 	// payload types (4 bits)
 	const uint8_t PAYLOAD_TYPE_SESSION_REQUEST = 0;
@@ -76,11 +79,15 @@ namespace ssu
 			size_t GetNumSentBytes () const { return m_NumSentBytes; };
 			size_t GetNumReceivedBytes () const { return m_NumReceivedBytes; };
 			
-			
+			void SendKeepAlive ();	
+			uint32_t GetRelayTag () const { return m_RelayTag; };	
+			uint32_t GetCreationTime () const { return m_CreationTime; };
+
 		private:
 
 			void CreateAESandMacKey (const uint8_t * pubKey); 
 
+			void PostI2NPMessage (I2NPMessage * msg);
 			void ProcessMessage (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint); // call for established session
 			void ProcessSessionRequest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint);
 			void SendSessionRequest ();
@@ -89,16 +96,18 @@ namespace ssu
 			void SendSessionCreated (const uint8_t * x);
 			void ProcessSessionConfirmed (uint8_t * buf, size_t len);
 			void SendSessionConfirmed (const uint8_t * y, const uint8_t * ourAddress);
-			void ProcessRelayRequest (uint8_t * buf, size_t len);
-			void SendRelayResponse (uint32_t nonce, const boost::asio::ip::udp::endpoint& from, const uint8_t * introKey, const boost::asio::ip::udp::endpoint& to);
+			void ProcessRelayRequest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& from);
+			void SendRelayResponse (uint32_t nonce, const boost::asio::ip::udp::endpoint& from,
+				const uint8_t * introKey, const boost::asio::ip::udp::endpoint& to);
 			void SendRelayIntro (SSUSession * session, const boost::asio::ip::udp::endpoint& from);
 			void ProcessRelayResponse (uint8_t * buf, size_t len);
 			void ProcessRelayIntro (uint8_t * buf, size_t len);
 			void Established ();
 			void Failed ();
+			void ScheduleConnectTimer ();
 			void HandleConnectTimer (const boost::system::error_code& ecode);
 			void ProcessPeerTest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint);
-			void SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, uint8_t * introKey); // Charlie to Alice
+			void SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, const uint8_t * introKey, bool toAddress = true); 
 			void ProcessData (uint8_t * buf, size_t len);		
 			void SendSesionDestroyed ();
 			void Send (uint8_t type, const uint8_t * payload, size_t len); // with session key
@@ -113,13 +122,14 @@ namespace ssu
 
 			void ScheduleTermination ();
 			void HandleTerminationTimer (const boost::system::error_code& ecode);
-			
+
 		private:
 	
 			friend class SSUData; // TODO: change in later
 			SSUServer& m_Server;
 			boost::asio::ip::udp::endpoint m_RemoteEndpoint;
 			const i2p::data::RouterInfo * m_RemoteRouter;
+			i2p::data::IdentHash m_RemoteIdent; // if m_RemoteRouter is null
 			boost::asio::deadline_timer m_Timer;
 			i2p::data::DHKeysPair * m_DHKeysPair; // X - for client and Y - for server
 			bool m_PeerTest;
@@ -133,6 +143,7 @@ namespace ssu
 			std::list<i2p::I2NPMessage *> m_DelayedMessages;
 			SSUData m_Data;
 			size_t m_NumSentBytes, m_NumReceivedBytes;
+			uint32_t m_CreationTime; // seconds since epoch
 	};
 
 	class SSUServer
@@ -146,6 +157,7 @@ namespace ssu
 			SSUSession * GetSession (const i2p::data::RouterInfo * router, bool peerTest = false);
 			SSUSession * FindSession (const i2p::data::RouterInfo * router);
 			SSUSession * FindSession (const boost::asio::ip::udp::endpoint& e);
+			SSUSession * GetRandomEstablishedSession (const SSUSession * excluded);
 			void DeleteSession (SSUSession * session);
 			void DeleteAllSessions ();			
 
@@ -159,8 +171,15 @@ namespace ssu
 
 			void Run ();
 			void Receive ();
-			void HandleReceivedFrom (const boost::system::error_code& ecode, std::size_t bytes_transferred);
+			void HandleReceivedFrom (const boost::system::error_code& ecode, std::size_t bytes_transferred);	
 
+			template<typename Filter>
+			SSUSession * GetRandomSession (Filter filter);
+			
+			std::set<SSUSession *> FindIntroducers (int maxNumIntroducers);	
+			void ScheduleIntroducersUpdateTimer ();
+			void HandleIntroducersUpdateTimer (const boost::system::error_code& ecode);
+			
 		private:
 
 			bool m_IsRunning;
@@ -170,6 +189,8 @@ namespace ssu
 			boost::asio::ip::udp::endpoint m_Endpoint;
 			boost::asio::ip::udp::socket m_Socket;
 			boost::asio::ip::udp::endpoint m_SenderEndpoint;
+			boost::asio::deadline_timer m_IntroducersUpdateTimer;
+			std::list<boost::asio::ip::udp::endpoint> m_Introducers; // introducers we are connected to
 			uint8_t m_ReceiveBuffer[2*SSU_MTU];
 			std::map<boost::asio::ip::udp::endpoint, SSUSession *> m_Sessions;
 			std::map<uint32_t, boost::asio::ip::udp::endpoint> m_Relays; // we are introducer

@@ -198,8 +198,7 @@ namespace tunnel
 	
 	Tunnels tunnels;
 	
-	Tunnels::Tunnels (): m_IsRunning (false), m_IsTunnelCreated (false), 
-		m_NextReplyMsgID (555), m_Thread (nullptr), m_ExploratoryPool (nullptr)
+	Tunnels::Tunnels (): m_IsRunning (false), m_Thread (nullptr), m_ExploratoryPool (nullptr)
 	{
 	}
 	
@@ -217,9 +216,9 @@ namespace tunnel
 			delete it.second;
 		m_TransitTunnels.clear ();
 
-		for (auto& it : m_PendingTunnels)
+		/*for (auto& it : m_PendingTunnels)
 			delete it.second;
-		m_PendingTunnels.clear ();
+		m_PendingTunnels.clear ();*/
 
 		for (auto& it: m_Pools)
 			delete it.second;
@@ -245,12 +244,11 @@ namespace tunnel
 	Tunnel * Tunnels::GetPendingTunnel (uint32_t replyMsgID)
 	{
 		auto it = m_PendingTunnels.find(replyMsgID);
-		if (it != m_PendingTunnels.end ())
-		{
-			Tunnel * t = it->second;
-			m_PendingTunnels.erase (it);
-			return t;
-		}	
+		if (it != m_PendingTunnels.end () && it->second->GetState () == eTunnelStatePending)
+		{	
+			it->second->SetState (eTunnelStateBuildReplyReceived);	
+			return it->second;
+		}
 		return nullptr;
 	}	
 
@@ -260,7 +258,7 @@ namespace tunnel
 		size_t minReceived = 0;
 		for (auto it : m_InboundTunnels)
 		{
-			if (it.second->IsFailed ()) continue;
+			if (!it.second->IsEstablished ()) continue;
 			if (!tunnel || it.second->GetNumReceivedBytes () < minReceived)
 			{
 				tunnel = it.second;
@@ -277,12 +275,12 @@ namespace tunnel
 		OutboundTunnel * tunnel = nullptr;
 		for (auto it: m_OutboundTunnels)
 		{	
-			if (i >= ind) return it;
-			if (!it->IsFailed ())
+			if (it->IsEstablished ())
 			{
 				tunnel = it;
 				i++;
 			}
+			if (i > ind && tunnel) break;
 		}	
 		return tunnel;
 	}	
@@ -305,6 +303,7 @@ namespace tunnel
 	
 	void Tunnels::AddTransitTunnel (TransitTunnel * tunnel)
 	{
+		std::unique_lock<std::mutex> l(m_TransitTunnelsMutex);
 		m_TransitTunnels[tunnel->GetTunnelID ()] = tunnel;
 	}	
 
@@ -372,52 +371,68 @@ namespace tunnel
 
 	void Tunnels::ManageTunnels ()
 	{
-		// check pending tunnel. if something is still there, wipe it out
-		// because it wouldn't be responded anyway
-		for (auto& it : m_PendingTunnels)
+		// check pending tunnel. delete failed or timeout
+		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
+		for (auto it = m_PendingTunnels.begin (); it != m_PendingTunnels.end ();)
 		{	
-			LogPrint ("Pending tunnel build request ", it.first, " has not been responded. Deleted");
-			if (it.second->GetTunnelConfig ()->GetFirstHop ()->isGateway) // outbound
-				i2p::transports.CloseSession (it.second->GetTunnelConfig ()->GetFirstHop ()->router);
-			delete it.second;
+			auto tunnel = it->second;
+			switch (tunnel->GetState ())
+			{
+				case eTunnelStatePending: 
+					if (ts > tunnel->GetCreationTime () + TUNNEL_CREATION_TIMEOUT)
+					{
+						LogPrint ("Pending tunnel build request ", it->first, " timeout. Deleted");
+						delete tunnel;
+						it = m_PendingTunnels.erase (it);
+					}
+					else
+						it++;
+				break;
+				case eTunnelStateBuildFailed:
+					LogPrint ("Pending tunnel build request ", it->first, " failed. Deleted");
+					delete tunnel;
+					it = m_PendingTunnels.erase (it);
+				break;
+				case eTunnelStateBuildReplyReceived:
+					// intermidiate state, will be either established of build failed
+					it++;
+				break;	
+				default:
+					it = m_PendingTunnels.erase (it);
+			}	
 		}	
-		m_PendingTunnels.clear ();
 		
 		ManageInboundTunnels ();
 		ManageOutboundTunnels ();
 		ManageTransitTunnels ();
 		ManageTunnelPools ();
-		
-	/*	if (!m_IsTunnelCreated)
-		{	
-			InboundTunnel * inboundTunnel = CreateOneHopInboundTestTunnel ();
-			if (inboundTunnel)
-			    CreateOneHopOutboundTestTunnel (inboundTunnel);
-			inboundTunnel = CreateTwoHopsInboundTestTunnel ();
-			if (inboundTunnel)
-				CreateTwoHopsOutboundTestTunnel (inboundTunnel);
-				
-			m_IsTunnelCreated = true;
-		}*/
 	}	
 
 	void Tunnels::ManageOutboundTunnels ()
 	{
 		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
-		for (auto it = m_OutboundTunnels.begin (); it != m_OutboundTunnels.end ();)
 		{
-			if (ts > (*it)->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+			std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
+			for (auto it = m_OutboundTunnels.begin (); it != m_OutboundTunnels.end ();)
 			{
-				LogPrint ("Tunnel ", (*it)->GetTunnelID (), " expired");
-				auto pool = (*it)->GetTunnelPool ();
-				if (pool)
-					pool->TunnelExpired (*it);
-				delete *it;
-				it = m_OutboundTunnels.erase (it);
-			}	
-			else 
-				it++;
-		}
+				auto tunnel = *it;
+				if (ts > tunnel->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+				{
+					LogPrint ("Tunnel ", tunnel->GetTunnelID (), " expired");
+					auto pool = tunnel->GetTunnelPool ();
+					if (pool)
+						pool->TunnelExpired (tunnel);
+					it = m_OutboundTunnels.erase (it);
+					delete tunnel;
+				}	
+				else 
+				{
+					if (tunnel->IsEstablished () && ts + TUNNEL_EXPIRATION_THRESHOLD > tunnel->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+						tunnel->SetState (eTunnelStateExpiring);
+					it++;
+				}
+			}
+		}	
 	
 		if (m_OutboundTunnels.size () < 5) 
 		{
@@ -437,20 +452,28 @@ namespace tunnel
 	void Tunnels::ManageInboundTunnels ()
 	{
 		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
-		for (auto it = m_InboundTunnels.begin (); it != m_InboundTunnels.end ();)
 		{
-			if (ts > it->second->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
+			for (auto it = m_InboundTunnels.begin (); it != m_InboundTunnels.end ();)
 			{
-				LogPrint ("Tunnel ", it->second->GetTunnelID (), " expired");
-				auto pool = it->second->GetTunnelPool ();
-				if (pool)
-					pool->TunnelExpired (it->second);
-				delete it->second;
-				it = m_InboundTunnels.erase (it);
-			}	
-			else 
-				it++;
-		}
+				auto tunnel = it->second;
+				if (ts > tunnel->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+				{
+					LogPrint ("Tunnel ", tunnel->GetTunnelID (), " expired");
+					auto pool = tunnel->GetTunnelPool ();
+					if (pool)
+						pool->TunnelExpired (tunnel);
+					it = m_InboundTunnels.erase (it);
+					delete tunnel;
+				}	
+				else 
+				{
+					if (tunnel->IsEstablished () && ts + TUNNEL_EXPIRATION_THRESHOLD > tunnel->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
+						tunnel->SetState (eTunnelStateExpiring);
+					it++;
+				}
+			}
+		}	
 
 		if (m_InboundTunnels.empty ())
 		{
@@ -482,7 +505,10 @@ namespace tunnel
 			{
 				LogPrint ("Transit tunnel ", it->second->GetTunnelID (), " expired");
 				auto tmp = it->second;
-				it = m_TransitTunnels.erase (it);
+				{
+					std::unique_lock<std::mutex> l(m_TransitTunnelsMutex);
+					it = m_TransitTunnels.erase (it);
+				}	
 				delete tmp;
 			}	
 			else 
@@ -508,14 +534,15 @@ namespace tunnel
 	TTunnel * Tunnels::CreateTunnel (TunnelConfig * config, OutboundTunnel * outboundTunnel)
 	{
 		TTunnel * newTunnel = new TTunnel (config);
-		m_PendingTunnels[m_NextReplyMsgID] = newTunnel; 
-		newTunnel->Build (m_NextReplyMsgID, outboundTunnel);
-		m_NextReplyMsgID++; // TODO: should be atomic
+		uint32_t replyMsgID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
+		m_PendingTunnels[replyMsgID] = newTunnel; 
+		newTunnel->Build (replyMsgID, outboundTunnel);
 		return newTunnel;
 	}	
 
 	void Tunnels::AddOutboundTunnel (OutboundTunnel * newTunnel)
 	{
+		std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
 		m_OutboundTunnels.push_back (newTunnel);
 		auto pool = newTunnel->GetTunnelPool ();
 		if (pool)
@@ -524,6 +551,7 @@ namespace tunnel
 
 	void Tunnels::AddInboundTunnel (InboundTunnel * newTunnel)
 	{
+		std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 		m_InboundTunnels[newTunnel->GetTunnelID ()] = newTunnel;
 		auto pool = newTunnel->GetTunnelPool ();
 		if (!pool)

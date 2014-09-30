@@ -76,6 +76,12 @@ namespace i2p
 		}
 	}
 
+	void DHKeysPairSupplier::Return (i2p::data::DHKeysPair * pair)
+	{
+		std::unique_lock<std::mutex>  l(m_AcquiredMutex);
+		m_Queue.push (pair);
+	}
+
 	Transports transports;	
 	
 	Transports::Transports (): 
@@ -129,12 +135,14 @@ namespace i2p
 		{
 			m_SSUServer->Stop ();
 			delete m_SSUServer;
+			m_SSUServer = nullptr;
 		}	
 		
 		for (auto session: m_NTCPSessions)
 			delete session.second;
 		m_NTCPSessions.clear ();
 		delete m_NTCPAcceptor;
+		m_NTCPAcceptor = nullptr;
 
 		m_DHKeysPairSupplier.Stop ();
 		m_IsRunning = false;
@@ -143,7 +151,7 @@ namespace i2p
 		{	
 			m_Thread->join (); 
 			delete m_Thread;
-			m_Thread = 0;
+			m_Thread = nullptr;
 		}	
 	}	
 
@@ -182,13 +190,14 @@ namespace i2p
 			conn->ServerLogin ();
 		}
 		else
-		{
 			delete conn;
-		}
 
-    	conn = new i2p::ntcp::NTCPServerConnection (m_Service);
-		m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
-			conn, boost::asio::placeholders::error));
+		if (error != boost::asio::error::operation_aborted)
+		{
+    		conn = new i2p::ntcp::NTCPServerConnection (m_Service);
+			m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
+				conn, boost::asio::placeholders::error));
+		}	
 	}
 
 	i2p::ntcp::NTCPSession * Transports::GetNextNTCPSession ()
@@ -258,11 +267,31 @@ namespace i2p
 			{
 				LogPrint ("Router not found. Requested");
 				i2p::data::netdb.RequestDestination (ident);
-				DeleteI2NPMessage (msg); // TODO: implement a placeholder for router and send once it's available
+				auto resendTimer = new boost::asio::deadline_timer (m_Service);
+				resendTimer->expires_from_now (boost::posix_time::seconds(5)); // 5 seconds
+				resendTimer->async_wait (boost::bind (&Transports::HandleResendTimer,
+					this, boost::asio::placeholders::error, resendTimer, ident, msg));			
 			}	
 		}	
 	}	
 
+	void Transports::HandleResendTimer (const boost::system::error_code& ecode, 
+		boost::asio::deadline_timer * timer, const i2p::data::IdentHash& ident, i2p::I2NPMessage * msg)
+	{
+		RouterInfo * r = netdb.FindRouter (ident);
+		if (r)
+		{
+			LogPrint ("Router found. Sending message");
+			PostMessage (ident, msg);
+		}	
+		else
+		{
+			LogPrint ("Router not found. Failed to send message");
+			DeleteI2NPMessage (msg);
+		}	
+		delete timer;
+	}	
+		
 	void Transports::CloseSession (const i2p::data::RouterInfo * router)
 	{
 		if (!router) return;
@@ -294,5 +323,10 @@ namespace i2p
 	i2p::data::DHKeysPair * Transports::GetNextDHKeysPair ()
 	{
 		return m_DHKeysPairSupplier.Acquire ();
+	}
+
+	void Transports::ReuseDHKeysPair (i2p::data::DHKeysPair * pair)
+	{
+		m_DHKeysPairSupplier.Return (pair);
 	}
 }
