@@ -96,7 +96,7 @@ namespace stream
 				SendQuickAck ();	
 			else if (isSyn)
 				// we have to send SYN back to incoming connection
-				Send (nullptr, 0, 0); // also sets m_IsOpen				
+				Send (nullptr, 0); // also sets m_IsOpen				
 		}	
 		else 
 		{	
@@ -229,7 +229,7 @@ namespace stream
 			m_ResendTimer.cancel ();
 	}		
 		
-	size_t Stream::Send (const uint8_t * buf, size_t len, int timeout)
+	size_t Stream::Send (const uint8_t * buf, size_t len)
 	{
 		bool isNoAck = m_LastReceivedSequenceNumber < 0; // first packet
 		while (!m_IsOpen || len > 0)
@@ -519,8 +519,8 @@ namespace stream
 			LogPrint ("Local address ", GetIdentHash ().ToBase32 (), ".b32.i2p created");
 	}
 
-	StreamingDestination::StreamingDestination (boost::asio::io_service& service, const std::string& fullPath):
-		m_Service (service), m_LeaseSet (nullptr), m_IsPublic (true) 
+	StreamingDestination::StreamingDestination (boost::asio::io_service& service, const std::string& fullPath, bool isPublic):
+		m_Service (service), m_LeaseSet (nullptr), m_IsPublic (isPublic) 
 	{
 		std::ifstream s(fullPath.c_str (), std::ifstream::binary);
 		if (s.is_open ())	
@@ -704,7 +704,7 @@ namespace stream
 #else
 				it->path();
 #endif
-				auto localDestination = new StreamingDestination (m_Service, fullPath);
+				auto localDestination = new StreamingDestination (m_Service, fullPath, true);
 				m_Destinations[localDestination->GetIdentHash ()] = localDestination;
 				numDestinations++;
 			}	
@@ -713,9 +713,9 @@ namespace stream
 			LogPrint (numDestinations, " local destinations loaded");
 	}	
 	
-	StreamingDestination * StreamingDestinations::LoadLocalDestination (const std::string& filename)
+	StreamingDestination * StreamingDestinations::LoadLocalDestination (const std::string& filename, bool isPublic)
 	{
-		auto localDestination = new StreamingDestination (m_Service, i2p::util::filesystem::GetFullPath (filename));
+		auto localDestination = new StreamingDestination (m_Service, i2p::util::filesystem::GetFullPath (filename), isPublic);
 		m_Destinations[localDestination->GetIdentHash ()] = localDestination;
 		return localDestination;
 	}
@@ -738,13 +738,13 @@ namespace stream
 		}
 	}
 
-	StreamingDestination * StreamingDestinations::GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
+	StreamingDestination * StreamingDestinations::CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
 	{
 		auto it = m_Destinations.find (keys.GetPublic ().GetIdentHash ());
 		if (it != m_Destinations.end ())
 		{
 			LogPrint ("Local destination ", keys.GetPublic ().GetIdentHash ().ToBase32 (), ".b32.i2p exists");
-			return it->second;
+			return nullptr;
 		}	
 		auto localDestination = new StreamingDestination (m_Service, keys, isPublic);
 		m_Destinations[keys.GetPublic ().GetIdentHash ()] = localDestination;
@@ -825,14 +825,14 @@ namespace stream
 		return destinations.CreateNewLocalDestination (isPublic);
 	}
 
+	StreamingDestination * CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
+	{
+		return destinations.CreateNewLocalDestination (keys, isPublic);
+	}
+
 	void DeleteLocalDestination (StreamingDestination * destination)
 	{
 		destinations.DeleteLocalDestination (destination);
-	}
-
-	StreamingDestination * GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
-	{
-		return destinations.GetLocalDestination (keys, isPublic);
 	}
 
 	StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination)
@@ -840,9 +840,9 @@ namespace stream
 		return destinations.FindLocalDestination (destination);
 	}
 
-	StreamingDestination * LoadLocalDestination (const std::string& filename)
+	StreamingDestination * LoadLocalDestination (const std::string& filename, bool isPublic)
 	{
-		return destinations.LoadLocalDestination (filename);
+		return destinations.LoadLocalDestination (filename, isPublic);
 	}		
 
 	const StreamingDestinations& GetLocalDestinations ()

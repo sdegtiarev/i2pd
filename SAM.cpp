@@ -12,8 +12,9 @@ namespace i2p
 namespace stream
 {
 	SAMSocket::SAMSocket (SAMBridge& owner): 
-		m_Owner (owner), m_Socket (m_Owner.GetService ()), m_SocketType (eSAMSocketTypeUnknown),
-		 m_IsSilent (false), m_Stream (nullptr)
+		m_Owner (owner), m_Socket (m_Owner.GetService ()), m_Timer (m_Owner.GetService ()),
+		m_SocketType (eSAMSocketTypeUnknown), m_IsSilent (false), m_Stream (nullptr),
+		m_Session (nullptr)
 	{
 	}
 
@@ -176,6 +177,8 @@ namespace stream
 						ProcessStreamAccept (separator + 1, bytes_transferred - (separator - m_Buffer) - 1);
 					else if (!strcmp (m_Buffer, SAM_DEST_GENERATE))
 						ProcessDestGenerate ();
+					else if (!strcmp (m_Buffer, SAM_NAMING_LOOKUP))
+						ProcessNamingLookup (separator + 1, bytes_transferred - (separator - m_Buffer) - 1);
 					else		
 					{	
 						LogPrint ("SAM unexpected message ", m_Buffer);		
@@ -204,20 +207,26 @@ namespace stream
 		std::string& id = params[SAM_PARAM_ID];
 		std::string& destination = params[SAM_PARAM_DESTINATION];
 		m_ID = id;
-		auto session = m_Owner.CreateSession (id, destination == SAM_VALUE_TRANSIENT ? "" : destination); 
-		if (session)
+		if (m_Owner.FindSession (id))
+		{
+			// session exists
+			SendMessageReply (SAM_SESSION_CREATE_DUPLICATED_ID, strlen(SAM_SESSION_CREATE_DUPLICATED_ID), true);
+			return;
+		}
+		m_Session = m_Owner.CreateSession (id, destination == SAM_VALUE_TRANSIENT ? "" : destination); 
+		if (m_Session)
 		{
 			m_SocketType = eSAMSocketTypeSession;
-			size_t l = strlen (SAM_SESSION_CREATE_REPLY_OK);
-			memcpy (m_Buffer, SAM_SESSION_CREATE_REPLY_OK, l);
-			uint8_t ident[1024];
-			size_t l1 = session->localDestination->GetPrivateKeys ().ToBuffer (ident, 1024);
-			size_t l2 = i2p::data::ByteStreamToBase64 (ident, l1, m_Buffer + l, SAM_SOCKET_BUFFER_SIZE - l);
-			m_Buffer[l + l2] = '\n';
-			SendMessageReply (m_Buffer, l + l2 + 1, false);
+			uint8_t buf[1024];
+			char priv[1024];
+			size_t l = m_Session->localDestination->GetPrivateKeys ().ToBuffer (buf, 1024);
+			size_t l1 = i2p::data::ByteStreamToBase64 (buf, l, priv, 1024);
+			priv[l1] = 0;
+			size_t l2 = snprintf (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_SESSION_CREATE_REPLY_OK, priv);
+			SendMessageReply (m_Buffer, l2, false);
 		}
 		else
-			SendMessageReply (SAM_SESSION_CREATE_DUPLICATED_ID, strlen(SAM_SESSION_CREATE_DUPLICATED_ID), true);
+			SendMessageReply (SAM_SESSION_CREATE_DUPLICATED_DEST, strlen(SAM_SESSION_CREATE_DUPLICATED_DEST), true);
 	}
 
 	void SAMSocket::ProcessStreamConnect (char * buf, size_t len)
@@ -239,22 +248,42 @@ namespace stream
 			dest.FromBuffer (ident, l);
 			auto leaseSet = i2p::data::netdb.FindLeaseSet (dest.GetIdentHash ());
 			if (leaseSet)
-			{
-				m_SocketType = eSAMSocketTypeStream;
-				session->sockets.push_back (this);
-				m_Stream = session->localDestination->CreateNewOutgoingStream (*leaseSet);
-				m_Stream->Send ((uint8_t *)m_Buffer, 0, 0); // connect
-				I2PReceive ();			
-				SendMessageReply (SAM_STREAM_STATUS_OK, strlen(SAM_STREAM_STATUS_OK), false);
-			}
+				Connect (*leaseSet, session);
 			else
 			{
-				i2p::data::netdb.Subscribe (dest.GetIdentHash ());
-				SendMessageReply (SAM_STREAM_STATUS_CANT_REACH_PEER, strlen(SAM_STREAM_STATUS_CANT_REACH_PEER), true);
+				i2p::data::netdb.Subscribe (dest.GetIdentHash (), session->localDestination->GetTunnelPool ());
+				m_Timer.expires_from_now (boost::posix_time::seconds(SAM_CONNECT_TIMEOUT));
+				m_Timer.async_wait (boost::bind (&SAMSocket::HandleDestinationRequestTimer,
+					this, boost::asio::placeholders::error, dest.GetIdentHash (), session));	
 			}
 		}
 		else	
 			SendMessageReply (SAM_STREAM_STATUS_INVALID_ID, strlen(SAM_STREAM_STATUS_INVALID_ID), true);		
+	}
+
+	void SAMSocket::Connect (const i2p::data::LeaseSet& remote, SAMSession * session)
+	{
+		m_SocketType = eSAMSocketTypeStream;
+		session->sockets.push_back (this);
+		m_Stream = session->localDestination->CreateNewOutgoingStream (remote);
+		m_Stream->Send ((uint8_t *)m_Buffer, 0); // connect
+		I2PReceive ();			
+		SendMessageReply (SAM_STREAM_STATUS_OK, strlen(SAM_STREAM_STATUS_OK), false);
+	}
+
+	void SAMSocket::HandleDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident, SAMSession * session)
+	{
+		if (!ecode) // timeout expired
+		{
+			auto leaseSet = i2p::data::netdb.FindLeaseSet (ident);
+			if (leaseSet)
+				Connect (*leaseSet, session);
+			else
+			{
+				LogPrint ("SAM destination to connect not found");
+				SendMessageReply (SAM_STREAM_STATUS_CANT_REACH_PEER, strlen(SAM_STREAM_STATUS_CANT_REACH_PEER), true);
+			}
+		}
 	}
 
 	void SAMSocket::ProcessStreamAccept (char * buf, size_t len)
@@ -305,11 +334,36 @@ namespace stream
 			SendMessageReply (SAM_DEST_REPLY_I2P_ERROR, strlen(SAM_DEST_REPLY_I2P_ERROR), true);
 	}
 
+	void SAMSocket::ProcessNamingLookup (char * buf, size_t len)
+	{
+		LogPrint ("SAM naming lookup: ", buf);
+		std::map<std::string, std::string> params;
+		ExtractParams (buf, len, params);
+		std::string& name = params[SAM_PARAM_NAME];
+		if (name == "ME" && m_Session)
+		{
+			uint8_t buf[1024];
+			char pub[1024];
+			size_t l = m_Session->localDestination->GetIdentity ().ToBuffer (buf, 1024);
+			size_t l1 = i2p::data::ByteStreamToBase64 (buf, l, pub, 1024);
+			pub[l1] = 0;
+			size_t l2 = snprintf (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_NAMING_REPLY, pub);
+			SendMessageReply (m_Buffer, l2, false);
+		}
+		else
+		{
+			size_t len = snprintf (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_NAMING_REPLY_INVALID_KEY, name.c_str());
+			SendMessageReply (m_Buffer, len, true);
+		}
+	}	
+
 	void SAMSocket::ExtractParams (char * buf, size_t len, std::map<std::string, std::string>& params)
 	{
-		while (char * separator = strchr (buf, ' '))
+		char * separator;	
+		do
 		{
-			*separator = 0;
+			separator = strchr (buf, ' ');
+			if (separator) *separator = 0;
 			char * value = strchr (buf, '=');
 			if (value)
 			{
@@ -319,13 +373,14 @@ namespace stream
 			}	
 			buf = separator + 1;
 		}
+		while (separator);
 	}	
 
 	void SAMSocket::Receive ()
 	{
 		m_Socket.async_read_some (boost::asio::buffer(m_Buffer, SAM_SOCKET_BUFFER_SIZE),                
-			boost::bind(&SAMSocket::HandleReceived, this, 
-			boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
+			boost::bind((m_SocketType == eSAMSocketTypeSession) ? &SAMSocket::HandleMessage : &SAMSocket::HandleReceived,
+			this, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred));
 	}
 
 	void SAMSocket::HandleReceived (const boost::system::error_code& ecode, std::size_t bytes_transferred)
@@ -339,7 +394,7 @@ namespace stream
 		else
 		{
 			if (m_Stream)
-				m_Stream->Send ((uint8_t *)m_Buffer, bytes_transferred, 0);
+				m_Stream->Send ((uint8_t *)m_Buffer, bytes_transferred);
 			Receive ();
 		}
 	}
@@ -474,9 +529,6 @@ namespace stream
 
 	SAMSession * SAMBridge::CreateSession (const std::string& id, const std::string& destination)
 	{
-		if (m_Sessions.find (id) != m_Sessions.end ()) // session exists
- 			return nullptr;
-
 		StreamingDestination * localDestination = nullptr; 
 		if (destination != "")
 		{
@@ -485,7 +537,7 @@ namespace stream
 			i2p::data::PrivateKeys keys;
 			keys.FromBuffer (buf, l);
 			delete[] buf;
-			localDestination = GetLocalDestination (keys);
+			localDestination = CreateNewLocalDestination (keys);
 		}
 		else // transient
 			localDestination = CreateNewLocalDestination (); 
@@ -493,9 +545,10 @@ namespace stream
 		{
 			SAMSession session;
 			session.localDestination = localDestination;
-			session.isTransient = destination == "";
-			m_Sessions[id] = session;
-			return &m_Sessions[id];
+			auto ret = m_Sessions.insert (std::pair<std::string, SAMSession>(id, session));
+			if (!ret.second)
+				LogPrint ("Session ", id, " already exists");
+			return &(ret.first->second);
 		}
 		return nullptr;
 	}
@@ -508,8 +561,7 @@ namespace stream
 			for (auto it1 : it->second.sockets)
 				delete it1;
 			it->second.sockets.clear ();
-			if (it->second.isTransient)
-				DeleteLocalDestination (it->second.localDestination);
+			DeleteLocalDestination (it->second.localDestination);
 			m_Sessions.erase (it);
 		}
 	}

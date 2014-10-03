@@ -256,6 +256,7 @@ namespace tunnel
 	{
 		InboundTunnel * tunnel  = nullptr; 
 		size_t minReceived = 0;
+		std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 		for (auto it : m_InboundTunnels)
 		{
 			if (!it.second->IsEstablished ()) continue;
@@ -273,6 +274,7 @@ namespace tunnel
 		CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
 		uint32_t ind = rnd.GenerateWord32 (0, m_OutboundTunnels.size () - 1), i = 0;
 		OutboundTunnel * tunnel = nullptr;
+		std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
 		for (auto it: m_OutboundTunnels)
 		{	
 			if (it->IsEstablished ())
@@ -412,7 +414,6 @@ namespace tunnel
 	{
 		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
 		{
-			std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
 			for (auto it = m_OutboundTunnels.begin (); it != m_OutboundTunnels.end ();)
 			{
 				auto tunnel = *it;
@@ -422,7 +423,10 @@ namespace tunnel
 					auto pool = tunnel->GetTunnelPool ();
 					if (pool)
 						pool->TunnelExpired (tunnel);
-					it = m_OutboundTunnels.erase (it);
+					{
+						std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
+						it = m_OutboundTunnels.erase (it);
+					}
 					delete tunnel;
 				}	
 				else 
@@ -453,7 +457,6 @@ namespace tunnel
 	{
 		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
 		{
-			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 			for (auto it = m_InboundTunnels.begin (); it != m_InboundTunnels.end ();)
 			{
 				auto tunnel = it->second;
@@ -463,7 +466,10 @@ namespace tunnel
 					auto pool = tunnel->GetTunnelPool ();
 					if (pool)
 						pool->TunnelExpired (tunnel);
-					it = m_InboundTunnels.erase (it);
+					{
+						std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
+						it = m_InboundTunnels.erase (it);
+					}
 					delete tunnel;
 				}	
 				else 

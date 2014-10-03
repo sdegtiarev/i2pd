@@ -92,7 +92,7 @@ namespace stream
 			StreamingDestination * GetLocalDestination () { return m_LocalDestination; };
 			
 			void HandleNextPacket (Packet * packet);
-			size_t Send (const uint8_t * buf, size_t len, int timeout); // timeout in seconds
+			size_t Send (const uint8_t * buf, size_t len);
 			
 			template<typename Buffer, typename ReceiveHandler>
 			void AsyncReceive (const Buffer& buffer, ReceiveHandler handler, int timeout = 0);
@@ -143,7 +143,7 @@ namespace stream
 		public:
 
 			StreamingDestination (boost::asio::io_service& service, bool isPublic);
-			StreamingDestination (boost::asio::io_service& service, const std::string& fullPath);
+			StreamingDestination (boost::asio::io_service& service, const std::string& fullPath, bool isPublic);
 			StreamingDestination (boost::asio::io_service& service, const i2p::data::PrivateKeys& keys, bool isPublic);
 			~StreamingDestination ();	
 
@@ -199,10 +199,10 @@ namespace stream
 			void DeleteStream (Stream * stream);
 			StreamingDestination * GetSharedLocalDestination () const { return m_SharedLocalDestination; };
 			StreamingDestination * CreateNewLocalDestination (bool isPublic);
+			StreamingDestination * CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic);
 			void DeleteLocalDestination (StreamingDestination * destination);
-			StreamingDestination * GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic);
 			StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination) const;		
-			StreamingDestination * LoadLocalDestination (const std::string& filename);
+			StreamingDestination * LoadLocalDestination (const std::string& filename, bool isPublic);
 
 		private:	
 
@@ -231,10 +231,10 @@ namespace stream
 	void StopStreaming ();
 	StreamingDestination * GetSharedLocalDestination ();
 	StreamingDestination * CreateNewLocalDestination (bool isPublic = true);
+	StreamingDestination * CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic = true);	
 	void DeleteLocalDestination (StreamingDestination * destination);
-	StreamingDestination * GetLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic = true);
 	StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination);	
-	StreamingDestination * LoadLocalDestination (const std::string& filename);
+	StreamingDestination * LoadLocalDestination (const std::string& filename, bool isPublic);
 	// for HTTP
 	const StreamingDestinations& GetLocalDestinations ();	
 	
