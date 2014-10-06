@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <boost/filesystem.hpp>
 #include "Queue.h"
 #include "I2NPProtocol.h"
@@ -66,8 +67,7 @@ namespace data
 			void AddLeaseSet (const IdentHash& ident, const uint8_t * buf, int len);
 			RouterInfo * FindRouter (const IdentHash& ident) const;
 			LeaseSet * FindLeaseSet (const IdentHash& destination) const;
-			const IdentHash * FindAddress (const std::string& address) { return m_AddressBook.FindAddress (address); }; // TODO: move AddressBook away from NetDb
-			void InsertAddress (const std::string& address, const std::string& base64) { m_AddressBook.InsertAddress (address, base64); };
+			AddressBook& GetAddressBook () { return m_AddressBook; };// TODO: move AddressBook away from NetDb
 
 			void Subscribe (const IdentHash& ident, i2p::tunnel::TunnelPool * pool = nullptr); // keep LeaseSets upto date			
 			void Unsubscribe (const IdentHash& ident);	
@@ -115,6 +115,7 @@ namespace data
 
 			std::map<IdentHash, LeaseSet *> m_LeaseSets;
 			std::map<IdentHash, RouterInfo *> m_RouterInfos;
+			mutable std::mutex m_FloodfillsMutex;
 			std::vector<RouterInfo *> m_Floodfills;
 			std::mutex m_RequestedDestinationsMutex;
 			std::map<IdentHash, RequestedDestination *> m_RequestedDestinations;
