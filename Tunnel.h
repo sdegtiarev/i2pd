@@ -78,7 +78,7 @@ namespace tunnel
 			OutboundTunnel (TunnelConfig * config): Tunnel (config), m_Gateway (this) {};
 
 			void SendTunnelDataMsg (const uint8_t * gwHash, uint32_t gwTunnel, i2p::I2NPMessage * msg);
-			void SendTunnelDataMsg (std::vector<TunnelMessageBlock> msgs); // multiple messages
+			void SendTunnelDataMsg (const std::vector<TunnelMessageBlock>& msgs); // multiple messages
 			const i2p::data::RouterInfo * GetEndpointRouter () const 
 				{ return GetTunnelConfig ()->GetLastHop ()->router; }; 
 			size_t GetNumSentBytes () const { return m_Gateway.GetNumSentBytes (); };
@@ -129,7 +129,7 @@ namespace tunnel
 			void PostTunnelData (I2NPMessage * msg);
 			template<class TTunnel>
 			TTunnel * CreateTunnel (TunnelConfig * config, OutboundTunnel * outboundTunnel = 0);
-			TunnelPool * CreateTunnelPool (i2p::data::LocalDestination& localDestination, int numHops);
+			TunnelPool * CreateTunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops);
 			void DeleteTunnelPool (TunnelPool * pool);
 			
 		private:
@@ -139,6 +139,7 @@ namespace tunnel
 			void ManageOutboundTunnels ();
 			void ManageInboundTunnels ();
 			void ManageTransitTunnels ();
+			void ManagePendingTunnels ();
 			void ManageTunnelPools ();
 			
 			void CreateZeroHopsInboundTunnel ();
@@ -147,6 +148,7 @@ namespace tunnel
 
 			bool m_IsRunning;
 			std::thread * m_Thread;	
+			std::mutex m_PendingTunnelsMutex;
 			std::map<uint32_t, Tunnel *> m_PendingTunnels; // by replyMsgID
 			std::mutex m_InboundTunnelsMutex;
 			std::map<uint32_t, InboundTunnel *> m_InboundTunnels;

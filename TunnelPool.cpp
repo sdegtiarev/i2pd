@@ -10,17 +10,23 @@ namespace i2p
 {
 namespace tunnel
 {
-	TunnelPool::TunnelPool (i2p::data::LocalDestination& localDestination, int numHops, int numTunnels):
+	TunnelPool::TunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops, int numTunnels):
 		m_LocalDestination (localDestination), m_NumHops (numHops), m_NumTunnels (numTunnels)
 	{
 	}
 
 	TunnelPool::~TunnelPool ()
 	{
-		for (auto it: m_InboundTunnels)
-			it->SetTunnelPool (nullptr);
-		for (auto it: m_OutboundTunnels)
-			it->SetTunnelPool (nullptr);
+		{
+			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);	
+			for (auto it: m_InboundTunnels)
+				it->SetTunnelPool (nullptr);
+		}
+		{
+			std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
+			for (auto it: m_OutboundTunnels)
+				it->SetTunnelPool (nullptr);
+		}
 	}
 
 	void TunnelPool::TunnelCreated (InboundTunnel * createdTunnel)
@@ -215,7 +221,7 @@ namespace tunnel
 			DeleteI2NPMessage (msg);
 		}
 		else
-			i2p::garlic::routing.PostI2NPMsg (msg);
+			m_LocalDestination.ProcessDeliveryStatusMessage (msg);
 	}
 
 	const i2p::data::RouterInfo * TunnelPool::SelectNextHop (const i2p::data::RouterInfo * prevHop) const

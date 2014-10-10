@@ -14,6 +14,7 @@
 #include "LeaseSet.h"
 #include "I2NPProtocol.h"
 #include "Garlic.h"
+#include "Tunnel.h"
 
 namespace i2p
 {
@@ -76,8 +77,8 @@ namespace stream
 	{	
 		public:
 
-			Stream (boost::asio::io_service& service, StreamingDestination * local, const i2p::data::LeaseSet& remote); // outgoing
-			Stream (boost::asio::io_service& service, StreamingDestination * local); // incoming			
+			Stream (boost::asio::io_service& service, StreamingDestination& local, const i2p::data::LeaseSet& remote); // outgoing
+			Stream (boost::asio::io_service& service, StreamingDestination& local); // incoming			
 
 			~Stream ();
 			uint32_t GetSendStreamID () const { return m_SendStreamID; };
@@ -86,7 +87,7 @@ namespace stream
 			const i2p::data::IdentityEx& GetRemoteIdentity () const { return m_RemoteIdentity; };
 			bool IsOpen () const { return m_IsOpen; };
 			bool IsEstablished () const { return m_SendStreamID; };
-			StreamingDestination * GetLocalDestination () { return m_LocalDestination; };
+			StreamingDestination& GetLocalDestination () { return m_LocalDestination; };
 			
 			void HandleNextPacket (Packet * packet);
 			size_t Send (const uint8_t * buf, size_t len);
@@ -95,8 +96,6 @@ namespace stream
 			void AsyncReceive (const Buffer& buffer, ReceiveHandler handler, int timeout = 0);
 
 			void Close ();
-
-			void SetLeaseSetUpdated () { m_LeaseSetUpdated = true; };
 	
 		private:
 
@@ -122,13 +121,12 @@ namespace stream
 			boost::asio::io_service& m_Service;
 			uint32_t m_SendStreamID, m_RecvStreamID, m_SequenceNumber;
 			int32_t m_LastReceivedSequenceNumber;
-			bool m_IsOpen, m_LeaseSetUpdated;
-			StreamingDestination * m_LocalDestination;
+			bool m_IsOpen, m_IsReset;
+			StreamingDestination& m_LocalDestination;
 			i2p::data::IdentityEx m_RemoteIdentity;
 			const i2p::data::LeaseSet * m_RemoteLeaseSet;
 			i2p::garlic::GarlicRoutingSession * m_RoutingSession;
 			i2p::data::Lease m_CurrentRemoteLease;
-			i2p::tunnel::OutboundTunnel * m_CurrentOutboundTunnel;
 			std::queue<Packet *> m_ReceiveQueue;
 			std::set<Packet *, PacketCmp> m_SavedPackets;
 			std::set<Packet *, PacketCmp> m_SentPackets;
@@ -142,22 +140,16 @@ namespace stream
 	{
 		if (!m_ReceiveQueue.empty ())
 		{
-			size_t received = ConcatenatePackets (boost::asio::buffer_cast<uint8_t *>(buffer), 					boost::asio::buffer_size(buffer));
-			if (received)
-			{
-				// TODO: post to stream's thread
-				handler (boost::system::error_code (), received);
-				return;
-			}	
+			m_Service.post ([=](void) { this->HandleReceiveTimer (
+				boost::asio::error::make_error_code (boost::asio::error::operation_aborted),
+				buffer, handler); });
 		}
-		if (!m_IsOpen)
+		else
 		{
-			handler (boost::asio::error::make_error_code (boost::asio::error::connection_reset), 0);
-			return;
+			m_ReceiveTimer.expires_from_now (boost::posix_time::seconds(timeout));
+			m_ReceiveTimer.async_wait ([=](const boost::system::error_code& ecode)
+				{ this->HandleReceiveTimer (ecode, buffer, handler); });
 		}
-		m_ReceiveTimer.expires_from_now (boost::posix_time::seconds(timeout));
-		m_ReceiveTimer.async_wait ([=](const boost::system::error_code& ecode)
-			{ this->HandleReceiveTimer (ecode, buffer, handler); });
 	}
 
 	template<typename Buffer, typename ReceiveHandler>
@@ -172,7 +164,8 @@ namespace stream
 				handler (boost::system::error_code (), received); 
 			else
 				// socket closed
-				handler (boost::asio::error::make_error_code (boost::asio::error::operation_aborted), 0);
+				handler (m_IsReset ? boost::asio::error::make_error_code (boost::asio::error::connection_reset) :
+					boost::asio::error::make_error_code (boost::asio::error::operation_aborted), 0);
 		}	
 		else
 			// timeout expired

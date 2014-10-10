@@ -7,22 +7,25 @@
 #include "TunnelPool.h"
 #include "CryptoConst.h"
 #include "NetDb.h"
+#include "Garlic.h"
 #include "Streaming.h"
 
 namespace i2p
 {
 namespace stream
 {
-	class StreamingDestination: public i2p::data::LocalDestination 
+	class StreamingDestination: public i2p::garlic::GarlicDestination 
 	{
 		public:
 
-			StreamingDestination (boost::asio::io_service& service, bool isPublic);
-			StreamingDestination (boost::asio::io_service& service, const std::string& fullPath, bool isPublic);
-			StreamingDestination (boost::asio::io_service& service, const i2p::data::PrivateKeys& keys, bool isPublic);
+			StreamingDestination (bool isPublic);
+			StreamingDestination (const std::string& fullPath, bool isPublic);
+			StreamingDestination (const i2p::data::PrivateKeys& keys, bool isPublic);
 			~StreamingDestination ();	
 
-			const i2p::data::LeaseSet * GetLeaseSet ();
+			void Start ();
+			void Stop ();
+
 			i2p::tunnel::TunnelPool * GetTunnelPool () const  { return m_Pool; };			
 
 			Stream * CreateNewOutgoingStream (const i2p::data::LeaseSet& remote);
@@ -31,27 +34,45 @@ namespace stream
 			void ResetAcceptor () { m_Acceptor = nullptr; };
 			bool IsAcceptorSet () const { return m_Acceptor != nullptr; };	
 			void HandleNextPacket (Packet * packet);
+			void SendTunnelDataMsgs (const std::vector<i2p::tunnel::TunnelMessageBlock>& msgs);
+			void ResetCurrentOutboundTunnel () { m_CurrentOutboundTunnel = nullptr; };
+			// I2CP
+			void HandleDataMessage (const uint8_t * buf, size_t len);
+			I2NPMessage * CreateDataMessage (const uint8_t * payload, size_t len);
 
 			// implements LocalDestination
 			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };
 			const uint8_t * GetEncryptionPrivateKey () const { return m_EncryptionPrivateKey; };
 			const uint8_t * GetEncryptionPublicKey () const { return m_EncryptionPublicKey; };
+
+			// implements GarlicDestination
+			const i2p::data::LeaseSet * GetLeaseSet ();
+
+			// override GarlicDestination
+			void ProcessGarlicMessage (I2NPMessage * msg);
+			void ProcessDeliveryStatusMessage (I2NPMessage * msg);	
 			void SetLeaseSetUpdated ();
 
 		private:		
 	
+			void Run ();
 			Stream * CreateNewIncomingStream ();
 			void UpdateLeaseSet ();
 
 		private:
 
-			boost::asio::io_service& m_Service;
+			bool m_IsRunning;
+			std::thread * m_Thread;	
+			boost::asio::io_service m_Service;
+			boost::asio::io_service::work m_Work;
+
 			std::mutex m_StreamsMutex;
 			std::map<uint32_t, Stream *> m_Streams;
 			i2p::data::PrivateKeys m_Keys;
 			uint8_t m_EncryptionPublicKey[256], m_EncryptionPrivateKey[256];
 			
 			i2p::tunnel::TunnelPool * m_Pool;
+			i2p::tunnel::OutboundTunnel * m_CurrentOutboundTunnel;
 			i2p::data::LeaseSet * m_LeaseSet;
 			bool m_IsPublic;			
 
@@ -62,14 +83,11 @@ namespace stream
 	{
 		public:
 
-			StreamingDestinations (): m_IsRunning (false), m_Thread (nullptr), 
-				m_Work (m_Service), m_SharedLocalDestination (nullptr) {};
+			StreamingDestinations (): m_SharedLocalDestination (nullptr) {};
 			~StreamingDestinations () {};
 
 			void Start ();
 			void Stop ();
-
-			void HandleNextPacket (i2p::data::IdentHash destination, Packet * packet);
 
 			Stream * CreateClientStream (const i2p::data::LeaseSet& remote);
 			void DeleteStream (Stream * stream);
@@ -82,16 +100,9 @@ namespace stream
 
 		private:	
 
-			void Run ();
 			void LoadLocalDestinations ();
-			void PostNextPacket (i2p::data::IdentHash destination, Packet * packet); 
 			
 		private:
-
-			bool m_IsRunning;
-			std::thread * m_Thread;	
-			boost::asio::io_service m_Service;
-			boost::asio::io_service::work m_Work;
 
 			std::mutex m_DestinationsMutex;
 			std::map<i2p::data::IdentHash, StreamingDestination *> m_Destinations;
@@ -115,10 +126,6 @@ namespace stream
 	StreamingDestination * LoadLocalDestination (const std::string& filename, bool isPublic);
 	// for HTTP
 	const StreamingDestinations& GetLocalDestinations ();	
-	
-	// assuming data is I2CP message
-	void HandleDataMessage (i2p::data::IdentHash destination, const uint8_t * buf, size_t len);
-	I2NPMessage * CreateDataMessage (Stream * s, const uint8_t * payload, size_t len);
 }		
 }	
 

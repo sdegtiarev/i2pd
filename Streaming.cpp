@@ -10,21 +10,20 @@ namespace i2p
 {
 namespace stream
 {
-	Stream::Stream (boost::asio::io_service& service, StreamingDestination * local, 
+	Stream::Stream (boost::asio::io_service& service, StreamingDestination& local, 
 		const i2p::data::LeaseSet& remote): m_Service (service), m_SendStreamID (0), 
 		m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), m_IsOpen (false),  
-		m_LeaseSetUpdated (true), m_LocalDestination (local), m_RemoteLeaseSet (&remote),
-		m_RoutingSession (nullptr), m_CurrentOutboundTunnel (nullptr), 
-		m_ReceiveTimer (m_Service), m_ResendTimer (m_Service)
+		m_IsReset (false), m_LocalDestination (local), m_RemoteLeaseSet (&remote),
+		m_RoutingSession (nullptr), m_ReceiveTimer (m_Service), m_ResendTimer (m_Service)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 		UpdateCurrentRemoteLease ();
 	}	
 
-	Stream::Stream (boost::asio::io_service& service, StreamingDestination * local):
+	Stream::Stream (boost::asio::io_service& service, StreamingDestination& local):
 		m_Service (service), m_SendStreamID (0), m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), 
-		m_IsOpen (false), m_LeaseSetUpdated (true), m_LocalDestination (local),
-		m_RemoteLeaseSet (nullptr), m_RoutingSession (nullptr), m_CurrentOutboundTunnel (nullptr), 
+		m_IsOpen (false), m_IsReset (false), m_LocalDestination (local), 
+		m_RemoteLeaseSet (nullptr), m_RoutingSession (nullptr), 
 		m_ReceiveTimer (m_Service), m_ResendTimer (m_Service)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
@@ -103,7 +102,7 @@ namespace stream
 			{
 				// we have received duplicate. Most likely our outbound tunnel is dead
 				LogPrint ("Duplicate message ", receivedSeqn, " received");
-				m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
+				m_LocalDestination.ResetCurrentOutboundTunnel (); // pick another outbound tunnel 
 				UpdateCurrentRemoteLease (); // pick another lease
 				SendQuickAck (); // resend ack for previous message again
 				delete packet; // packet dropped
@@ -186,6 +185,7 @@ namespace stream
 			LogPrint ("Closed");
 			SendQuickAck (); // send ack for close explicitly?
 			m_IsOpen = false;
+			m_IsReset = true;
 			m_ReceiveTimer.cancel ();
 			m_ResendTimer.cancel ();
 		}
@@ -254,17 +254,17 @@ namespace stream
 			if (!m_IsOpen)
 			{	
 				//  initial packet
-				m_IsOpen = true;
+				m_IsOpen = true; m_IsReset = false;
 				uint16_t flags = PACKET_FLAG_SYNCHRONIZE | PACKET_FLAG_FROM_INCLUDED | 
 					PACKET_FLAG_SIGNATURE_INCLUDED | PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED;
 				if (isNoAck) flags |= PACKET_FLAG_NO_ACK;
 				*(uint16_t *)(packet + size) = htobe16 (flags);
 				size += 2; // flags
-				size_t identityLen = m_LocalDestination->GetIdentity ().GetFullLen ();
-				size_t signatureLen = m_LocalDestination->GetIdentity ().GetSignatureLen ();
+				size_t identityLen = m_LocalDestination.GetIdentity ().GetFullLen ();
+				size_t signatureLen = m_LocalDestination.GetIdentity ().GetSignatureLen ();
 				*(uint16_t *)(packet + size) = htobe16 (identityLen + signatureLen + 2); // identity + signature + packet size
 				size += 2; // options size
-				m_LocalDestination->GetIdentity ().ToBuffer (packet + size, identityLen); 
+				m_LocalDestination.GetIdentity ().ToBuffer (packet + size, identityLen); 
 				size += identityLen; // from
 				*(uint16_t *)(packet + size) = htobe16 (STREAMING_MTU);
 				size += 2; // max packet size
@@ -277,7 +277,7 @@ namespace stream
 				buf += sentLen;
 				len -= sentLen;
 				size += sentLen; // payload
-				m_LocalDestination->Sign (packet, size, signature);
+				m_LocalDestination.Sign (packet, size, signature);
 			}	
 			else
 			{
@@ -348,13 +348,13 @@ namespace stream
 			size++; // resend delay
 			*(uint16_t *)(packet + size) = htobe16 (PACKET_FLAG_CLOSE | PACKET_FLAG_SIGNATURE_INCLUDED);
 			size += 2; // flags
-			size_t signatureLen = m_LocalDestination->GetIdentity ().GetSignatureLen ();
+			size_t signatureLen = m_LocalDestination.GetIdentity ().GetSignatureLen ();
 			*(uint16_t *)(packet + size) = htobe16 (signatureLen); // signature only
 			size += 2; // options size
 			uint8_t * signature = packet + size;
 			memset (packet + size, 0, signatureLen);
 			size += signatureLen; // signature
-			m_LocalDestination->Sign (packet, size, signature);
+			m_LocalDestination.Sign (packet, size, signature);
 			
 			p->len = size;
 			SendPacket (p);
@@ -411,42 +411,27 @@ namespace stream
 			}
 		}
 
-		const i2p::data::LeaseSet * leaseSet = nullptr;
-		if (m_LeaseSetUpdated)
+		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+		if (ts >= m_CurrentRemoteLease.endDate)
+			UpdateCurrentRemoteLease ();
+		if (ts < m_CurrentRemoteLease.endDate)
 		{	
-			leaseSet = m_LocalDestination->GetLeaseSet ();
-			m_LeaseSetUpdated = false;
+			std::vector<i2p::tunnel::TunnelMessageBlock> msgs;
+			for (auto it: packets)
+			{ 
+				auto msg = m_RoutingSession->WrapSingleMessage ( 
+					m_LocalDestination.CreateDataMessage (it->GetBuffer (), it->GetLength ()));
+				msgs.push_back (i2p::tunnel::TunnelMessageBlock 
+							{ 
+								i2p::tunnel::eDeliveryTypeTunnel,
+								m_CurrentRemoteLease.tunnelGateway, m_CurrentRemoteLease.tunnelID,
+								msg
+							});	
+			}
+			m_LocalDestination.SendTunnelDataMsgs (msgs);
 		}	
-
-		m_CurrentOutboundTunnel = m_LocalDestination->GetTunnelPool ()->GetNextOutboundTunnel (m_CurrentOutboundTunnel);
-		if (m_CurrentOutboundTunnel)
-		{
-			auto ts = i2p::util::GetMillisecondsSinceEpoch ();
-			if (ts >= m_CurrentRemoteLease.endDate)
-				UpdateCurrentRemoteLease ();
-			if (ts < m_CurrentRemoteLease.endDate)
-			{	
-				std::vector<i2p::tunnel::TunnelMessageBlock> msgs;
-				for (auto it: packets)
-				{ 
-					auto msg = m_RoutingSession->WrapSingleMessage ( 
-						CreateDataMessage (this, it->GetBuffer (), it->GetLength ()), 
-					    leaseSet);
-					msgs.push_back (i2p::tunnel::TunnelMessageBlock 
-								{ 
-									i2p::tunnel::eDeliveryTypeTunnel,
-									m_CurrentRemoteLease.tunnelGateway, m_CurrentRemoteLease.tunnelID,
-									msg
-								});	
-					leaseSet = nullptr; // send leaseSet only one time
-				}
-				m_CurrentOutboundTunnel->SendTunnelDataMsg (msgs);
-			}	
-			else
-				LogPrint ("All leases are expired");
-		}	
-		else 
-			LogPrint ("No outbound tunnels in the pool");
+		else
+			LogPrint ("All leases are expired");
 	}
 
 	void Stream::ScheduleResend ()
@@ -470,13 +455,14 @@ namespace stream
 				else
 				{
 					Close ();
+					m_IsReset = true;
 					m_ReceiveTimer.cancel ();
 					return;
 				}	
 			}	
 			if (packets.size () > 0)
 			{
-				m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
+				m_LocalDestination.ResetCurrentOutboundTunnel (); // pick another outbound tunnel 
 				UpdateCurrentRemoteLease (); // pick another lease
 				SendPackets (packets);
 			}	
@@ -495,7 +481,7 @@ namespace stream
 		if (m_RemoteLeaseSet)
 		{
 			if (!m_RoutingSession)
-				m_RoutingSession = i2p::garlic::routing.GetRoutingSession (*m_RemoteLeaseSet, 32);
+				m_RoutingSession = m_LocalDestination.GetRoutingSession (*m_RemoteLeaseSet, 32);
 			auto leases = m_RemoteLeaseSet->GetNonExpiredLeases ();
 			if (!leases.empty ())
 			{	

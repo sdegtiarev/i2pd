@@ -21,7 +21,7 @@ namespace stream
 	const int SAM_CONNECT_TIMEOUT = 5; // in seconds
 	const int SAM_NAMING_LOOKUP_TIMEOUT = 5; // in seconds
 	const char SAM_HANDSHAKE[] = "HELLO VERSION";
-	const char SAM_HANDSHAKE_REPLY[] = "HELLO REPLY RESULT=OK VERSION=3.1\n";
+	const char SAM_HANDSHAKE_REPLY[] = "HELLO REPLY RESULT=OK VERSION=3.0\n";
 	const char SAM_SESSION_CREATE[] = "SESSION CREATE";
 	const char SAM_SESSION_CREATE_REPLY_OK[] = "SESSION STATUS RESULT=OK DESTINATION=%s\n";
 	const char SAM_SESSION_CREATE_DUPLICATED_ID[] = "SESSION STATUS RESULT=DUPLICATED_ID\n";
@@ -91,8 +91,8 @@ namespace stream
 			void ProcessNamingLookup (char * buf, size_t len);
 			void ExtractParams (char * buf, size_t len, std::map<std::string, std::string>& params);
 
-			void Connect (const i2p::data::LeaseSet& remote, SAMSession * session);
-			void HandleStreamDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident, SAMSession * session);
+			void Connect (const i2p::data::LeaseSet& remote);
+			void HandleStreamDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident);
 			void HandleNamingLookupDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident);
 			void SendNamingLookupReply (i2p::data::LeaseSet * leaseSet);
 

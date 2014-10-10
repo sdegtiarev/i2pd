@@ -23,9 +23,15 @@ namespace data
 		const i2p::tunnel::InboundTunnel * replyTunnel)
 	{
 		I2NPMessage * msg = i2p::CreateDatabaseLookupMsg (m_Destination, 
-			replyTunnel->GetNextIdentHash (), replyTunnel->GetNextTunnelID (), m_IsExploratory, &m_ExcludedPeers, m_IsLeaseSet);
+			replyTunnel->GetNextIdentHash (), replyTunnel->GetNextTunnelID (), m_IsExploratory, 
+		    &m_ExcludedPeers, m_IsLeaseSet, m_Pool);
 		if (m_IsLeaseSet) // wrap lookup message into garlic
-			msg = i2p::garlic::routing.WrapSingleMessage (*router, msg);
+		{
+			if (m_Pool)
+				msg = m_Pool->GetGarlicDestination ().WrapMessage (*router, msg);
+			else
+				LogPrint ("Can't create garlic message without destination");
+		}	
 		m_ExcludedPeers.insert (router->GetIdentHash ());
 		m_LastRouter = router;
 		m_CreationTime = i2p::util::GetSecondsSinceEpoch ();
@@ -102,7 +108,7 @@ namespace data
 		{	
 			try
 			{	
-				I2NPMessage * msg = m_Queue.GetNextWithTimeout (30000); // 30 sec
+				I2NPMessage * msg = m_Queue.GetNextWithTimeout (15000); // 15 sec
 				if (msg)
 				{	
 					while (msg)
@@ -663,7 +669,7 @@ namespace data
 					{
 						uint8_t * sessionTag = sessionKey + 33; // take first tag
 						i2p::garlic::GarlicRoutingSession garlic (sessionKey, sessionTag);
-						replyMsg = garlic.WrapSingleMessage (replyMsg, nullptr);
+						replyMsg = garlic.WrapSingleMessage (replyMsg);
 					}
 				}	
 				auto exploratoryPool = i2p::tunnel::tunnels.GetExploratoryPool ();
@@ -942,7 +948,7 @@ namespace data
 			return;
 		}	
 		uint32_t replyToken = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
-		auto msg = i2p::garlic::routing.WrapSingleMessage (*floodfill, i2p::CreateDatabaseStoreMsg (leaseSet, replyToken));	
+		auto msg = pool->GetGarlicDestination ().WrapMessage (*floodfill, i2p::CreateDatabaseStoreMsg (leaseSet, replyToken));	
 		outbound->SendTunnelDataMsg (floodfill->GetIdentHash (), 0, msg);		
 	}
 }
