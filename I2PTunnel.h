@@ -6,14 +6,16 @@
 #include <set>
 #include <boost/asio.hpp>
 #include "Identity.h"
+#include "Destination.h"
 #include "Streaming.h"
 
 namespace i2p
 {
-namespace stream
+namespace client
 {
 	const size_t I2P_TUNNEL_CONNECTION_BUFFER_SIZE = 8192;
 	const int I2P_TUNNEL_CONNECTION_MAX_IDLE = 3600; // in seconds	
+	const int I2P_TUNNEL_DESTINATION_REQUEST_TIMEOUT = 10; // in seconds
 
 	class I2PTunnel;
 	class I2PTunnelConnection
@@ -22,7 +24,7 @@ namespace stream
 
 			I2PTunnelConnection (I2PTunnel * owner, boost::asio::ip::tcp::socket * socket,
 				const i2p::data::LeaseSet * leaseSet);
-			I2PTunnelConnection (I2PTunnel * owner, Stream * stream,  boost::asio::ip::tcp::socket * socket, 
+			I2PTunnelConnection (I2PTunnel * owner, i2p::stream::Stream * stream,  boost::asio::ip::tcp::socket * socket, 
 				const boost::asio::ip::tcp::endpoint& target); 
 			~I2PTunnelConnection ();
 
@@ -42,7 +44,7 @@ namespace stream
 
 			uint8_t m_Buffer[I2P_TUNNEL_CONNECTION_BUFFER_SIZE], m_StreamBuffer[I2P_TUNNEL_CONNECTION_BUFFER_SIZE];
 			boost::asio::ip::tcp::socket * m_Socket;
-			Stream * m_Stream;
+			i2p::stream::Stream * m_Stream;
 			I2PTunnel * m_Owner;
 	};	
 
@@ -50,22 +52,22 @@ namespace stream
 	{
 		public:
 
-			I2PTunnel (boost::asio::io_service& service, StreamingDestination * localDestination): 
+			I2PTunnel (boost::asio::io_service& service, ClientDestination * localDestination): 
 				m_Service (service), m_LocalDestination (localDestination) {};
 			virtual ~I2PTunnel () { ClearConnections (); }; 
 
 			void AddConnection (I2PTunnelConnection * conn);
 			void RemoveConnection (I2PTunnelConnection * conn);	
 			void ClearConnections ();
-			StreamingDestination * GetLocalDestination () { return m_LocalDestination; };
-			void SetLocalDestination (StreamingDestination * dest) { m_LocalDestination = dest; }; 			
+			ClientDestination * GetLocalDestination () { return m_LocalDestination; };
+			void SetLocalDestination (ClientDestination * dest) { m_LocalDestination = dest; }; 			
 
 			boost::asio::io_service& GetService () { return m_Service; };
 			
 		private:
 
 			boost::asio::io_service& m_Service;
-			StreamingDestination * m_LocalDestination;
+			ClientDestination * m_LocalDestination;
 			std::set<I2PTunnelConnection *> m_Connections;
 	};	
 	
@@ -74,7 +76,7 @@ namespace stream
 		public:
 
 			I2PClientTunnel (boost::asio::io_service& service, const std::string& destination, int port,
-				StreamingDestination * localDestination = nullptr);
+				ClientDestination * localDestination = nullptr);
 			~I2PClientTunnel ();				
 	
 			void Start ();
@@ -84,10 +86,13 @@ namespace stream
 
 			void Accept ();
 			void HandleAccept (const boost::system::error_code& ecode, boost::asio::ip::tcp::socket * socket);
-			
+			void HandleDestinationRequestTimer (const boost::system::error_code& ecode, boost::asio::ip::tcp::socket * socket);
+			void CreateConnection (boost::asio::ip::tcp::socket * socket);				
+
 		private:
 
 			boost::asio::ip::tcp::acceptor m_Acceptor;
+			boost::asio::deadline_timer m_Timer;
 			std::string m_Destination;
 			const i2p::data::IdentHash * m_DestinationIdentHash;
 			const i2p::data::LeaseSet * m_RemoteLeaseSet;
@@ -98,7 +103,7 @@ namespace stream
 		public:
 
 			I2PServerTunnel (boost::asio::io_service& service, const std::string& address, int port, 
-				StreamingDestination * localDestination);	
+				ClientDestination * localDestination);	
 
 			void Start ();
 			void Stop ();
@@ -106,7 +111,7 @@ namespace stream
 		private:
 
 			void Accept ();
-			void HandleAccept (Stream * stream);
+			void HandleAccept (i2p::stream::Stream * stream);
 
 		private:
 

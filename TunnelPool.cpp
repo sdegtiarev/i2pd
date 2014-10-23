@@ -11,26 +11,36 @@ namespace i2p
 namespace tunnel
 {
 	TunnelPool::TunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops, int numTunnels):
-		m_LocalDestination (localDestination), m_NumHops (numHops), m_NumTunnels (numTunnels)
+		m_LocalDestination (localDestination), m_NumHops (numHops), m_NumTunnels (numTunnels),
+		m_IsActive (true)
 	{
 	}
 
 	TunnelPool::~TunnelPool ()
 	{
+		DetachTunnels ();
+	}
+
+	void TunnelPool::DetachTunnels ()
+	{
 		{
 			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);	
 			for (auto it: m_InboundTunnels)
 				it->SetTunnelPool (nullptr);
+			m_InboundTunnels.clear ();
 		}
 		{
 			std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
 			for (auto it: m_OutboundTunnels)
 				it->SetTunnelPool (nullptr);
+			m_OutboundTunnels.clear ();
 		}
-	}
-
+		m_Tests.clear ();
+	}	
+		
 	void TunnelPool::TunnelCreated (InboundTunnel * createdTunnel)
 	{
+		if (!m_IsActive) return;
 		{
 			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 			m_InboundTunnels.insert (createdTunnel);
@@ -54,6 +64,7 @@ namespace tunnel
 
 	void TunnelPool::TunnelCreated (OutboundTunnel * createdTunnel)
 	{
+		if (!m_IsActive) return;
 		std::unique_lock<std::mutex> l(m_OutboundTunnelsMutex);
 		m_OutboundTunnels.insert (createdTunnel);
 	}
@@ -246,7 +257,7 @@ namespace tunnel
 		{	
 			// last hop
 			auto hop = outboundTunnel->GetTunnelConfig ()->GetFirstHop ()->router;
-			if (hop->GetIdentHash () != i2p::context.GetRouterIdentHash ()) // outbound shouldn't be zero-hop tunnel
+			if (hop->GetIdentHash () != i2p::context.GetIdentHash ()) // outbound shouldn't be zero-hop tunnel
 			{	
 				prevHop = hop;
 				hops.push_back (prevHop);

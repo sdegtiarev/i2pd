@@ -131,6 +131,7 @@ namespace tunnel
 			TTunnel * CreateTunnel (TunnelConfig * config, OutboundTunnel * outboundTunnel = 0);
 			TunnelPool * CreateTunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops);
 			void DeleteTunnelPool (TunnelPool * pool);
+			void StopTunnelPool (TunnelPool * pool);
 			
 		private:
 			
@@ -148,7 +149,6 @@ namespace tunnel
 
 			bool m_IsRunning;
 			std::thread * m_Thread;	
-			std::mutex m_PendingTunnelsMutex;
 			std::map<uint32_t, Tunnel *> m_PendingTunnels; // by replyMsgID
 			std::mutex m_InboundTunnelsMutex;
 			std::map<uint32_t, InboundTunnel *> m_InboundTunnels;

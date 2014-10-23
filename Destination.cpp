@@ -1,30 +1,33 @@
 #include <fstream>
 #include <algorithm>
 #include <cryptopp/dh.h>
-#include <cryptopp/gzip.h>
 #include "Log.h"
 #include "util.h"
+#include "NetDb.h"
 #include "Destination.h"
 
 namespace i2p
 {
-namespace stream
+namespace client
 {
-	StreamingDestination::StreamingDestination (bool isPublic): 
-		m_IsRunning (false), m_Thread (nullptr), m_Work (m_Service), 
-		m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic)
+	ClientDestination::ClientDestination (bool isPublic, i2p::data::SigningKeyType sigType): 
+		m_IsRunning (false), m_Thread (nullptr), m_Service (nullptr), m_Work (nullptr), 
+		m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic),
+		m_DatagramDestination (nullptr)
 	{		
-		m_Keys = i2p::data::PrivateKeys::CreateRandomKeys (/*i2p::data::SIGNING_KEY_TYPE_ECDSA_SHA256_P256*/); // uncomment for ECDSA
+		m_Keys = i2p::data::PrivateKeys::CreateRandomKeys (sigType);
 		CryptoPP::DH dh (i2p::crypto::elgp, i2p::crypto::elgg);
 		dh.GenerateKeyPair(i2p::context.GetRandomNumberGenerator (), m_EncryptionPrivateKey, m_EncryptionPublicKey);
 		m_Pool = i2p::tunnel::tunnels.CreateTunnelPool (*this, 3); // 3-hops tunnel
 		if (m_IsPublic)
 			LogPrint ("Local address ", GetIdentHash ().ToBase32 (), ".b32.i2p created");
+		m_StreamingDestination = new i2p::stream::StreamingDestination (*this); // TODO:
 	}
 
-	StreamingDestination::StreamingDestination (const std::string& fullPath, bool isPublic):
-		m_IsRunning (false), m_Thread (nullptr), m_Work (m_Service),
-		m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic) 
+	ClientDestination::ClientDestination (const std::string& fullPath, bool isPublic):
+		m_IsRunning (false), m_Thread (nullptr), m_Service (nullptr), m_Work (nullptr),
+		m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic),
+		m_DatagramDestination (nullptr)
 	{
 		std::ifstream s(fullPath.c_str (), std::ifstream::binary);
 		if (s.is_open ())	
@@ -41,7 +44,7 @@ namespace stream
 		else
 		{
 			LogPrint ("Can't open file ", fullPath, " Creating new one");
-			m_Keys = i2p::data::PrivateKeys::CreateRandomKeys (/*i2p::data::SIGNING_KEY_TYPE_ECDSA_SHA256_P256*/); 
+			m_Keys = i2p::data::PrivateKeys::CreateRandomKeys (i2p::data::SIGNING_KEY_TYPE_DSA_SHA1); 
 			std::ofstream f (fullPath, std::ofstream::binary | std::ofstream::out);
 			size_t len = m_Keys.GetFullLen ();
 			uint8_t * buf = new uint8_t[len];
@@ -55,57 +58,118 @@ namespace stream
 		CryptoPP::DH dh (i2p::crypto::elgp, i2p::crypto::elgg);
 		dh.GenerateKeyPair(i2p::context.GetRandomNumberGenerator (), m_EncryptionPrivateKey, m_EncryptionPublicKey);
 		m_Pool = i2p::tunnel::tunnels.CreateTunnelPool (*this, 3); // 3-hops tunnel 
+		m_StreamingDestination = new i2p::stream::StreamingDestination (*this); // TODO:
 	}
 
-	StreamingDestination::StreamingDestination (const i2p::data::PrivateKeys& keys, bool isPublic):
-		m_IsRunning (false), m_Thread (nullptr), m_Work (m_Service),	
-		m_Keys (keys), m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic)
+	ClientDestination::ClientDestination (const i2p::data::PrivateKeys& keys, bool isPublic):
+		m_IsRunning (false), m_Thread (nullptr), m_Service (nullptr), m_Work (nullptr),	
+		m_Keys (keys), m_CurrentOutboundTunnel (nullptr), m_LeaseSet (nullptr), m_IsPublic (isPublic),
+		m_DatagramDestination (nullptr)
 	{
 		CryptoPP::DH dh (i2p::crypto::elgp, i2p::crypto::elgg);
 		dh.GenerateKeyPair(i2p::context.GetRandomNumberGenerator (), m_EncryptionPrivateKey, m_EncryptionPublicKey);
 		m_Pool = i2p::tunnel::tunnels.CreateTunnelPool (*this, 3); // 3-hops tunnel 
 		if (m_IsPublic)
 			LogPrint ("Local address ", GetIdentHash ().ToBase32 (), ".b32.i2p created");
+		m_StreamingDestination = new i2p::stream::StreamingDestination (*this); // TODO:
 	}
 
-	StreamingDestination::~StreamingDestination ()
+	ClientDestination::~ClientDestination ()
 	{
-		{
-			std::unique_lock<std::mutex> l(m_StreamsMutex);
-			for (auto it: m_Streams)
-				delete it.second;
-			m_Streams.clear ();
-		}	
 		Stop ();
+		for (auto it: m_RemoteLeaseSets)
+			delete it.second;
 		if (m_Pool)
 			i2p::tunnel::tunnels.DeleteTunnelPool (m_Pool);		
 		delete m_LeaseSet;
+		delete m_Work;
+		delete m_Service;
+		delete m_StreamingDestination;
+		delete m_DatagramDestination;
 	}	
 
-	void StreamingDestination::Run ()
+	void ClientDestination::Run ()
 	{
-		m_Service.run ();
+		if (m_Service)
+			m_Service->run ();
 	}	
 
-	void StreamingDestination::Start ()
+	void ClientDestination::Start ()
 	{	
+		m_Service = new boost::asio::io_service;
+		m_Work = new boost::asio::io_service::work (*m_Service);
+		m_Pool->SetActive (true);
 		m_IsRunning = true;
-		m_Thread = new std::thread (std::bind (&StreamingDestination::Run, this));
+		m_Thread = new std::thread (std::bind (&ClientDestination::Run, this));
+		m_StreamingDestination->Start ();	
 	}
 		
-	void StreamingDestination::Stop ()
+	void ClientDestination::Stop ()
 	{	
+		m_StreamingDestination->Stop ();	
+		if (m_Pool)
+			i2p::tunnel::tunnels.StopTunnelPool (m_Pool);
 		m_IsRunning = false;
-		m_Service.stop ();
+		if (m_Service)
+			m_Service->stop ();
 		if (m_Thread)
 		{	
 			m_Thread->join (); 
 			delete m_Thread;
 			m_Thread = 0;
 		}	
+		delete m_Work; m_Work = nullptr;
+		delete m_Service; m_Service = nullptr;
 	}	
 
-	void StreamingDestination::SendTunnelDataMsgs (const std::vector<i2p::tunnel::TunnelMessageBlock>& msgs)
+	const i2p::data::LeaseSet * ClientDestination::FindLeaseSet (const i2p::data::IdentHash& ident)
+	{
+		auto it = m_RemoteLeaseSets.find (ident);
+		if (it != m_RemoteLeaseSets.end ())
+		{	
+			if (it->second->HasNonExpiredLeases ())
+				return it->second;
+			else
+			{
+				LogPrint ("All leases of remote LeaseSet expired. Request it");
+				i2p::data::netdb.RequestDestination (ident, true, m_Pool);
+			}	
+		}	
+		else
+		{	
+			auto ls = i2p::data::netdb.FindLeaseSet (ident);
+			if (ls)
+			{
+				ls = new i2p::data::LeaseSet (*ls);
+				m_RemoteLeaseSets[ident] = ls;			
+				return ls;
+			}	
+		}
+		return nullptr;
+	}	
+
+	const i2p::data::LeaseSet * ClientDestination::GetLeaseSet ()
+	{
+		if (!m_Pool) return nullptr;
+		if (!m_LeaseSet)
+			UpdateLeaseSet ();
+		return m_LeaseSet;
+	}	
+
+	void ClientDestination::UpdateLeaseSet ()
+	{
+		auto newLeaseSet = new i2p::data::LeaseSet (*m_Pool);
+		if (!m_LeaseSet)
+			m_LeaseSet = newLeaseSet;
+		else
+		{	
+			// TODO: implement it better
+			*m_LeaseSet = *newLeaseSet;
+			delete newLeaseSet;
+		}	
+	}	
+
+	void ClientDestination::SendTunnelDataMsgs (const std::vector<i2p::tunnel::TunnelMessageBlock>& msgs)
 	{
 		m_CurrentOutboundTunnel = m_Pool->GetNextOutboundTunnel (m_CurrentOutboundTunnel);
 		if (m_CurrentOutboundTunnel)
@@ -118,324 +182,122 @@ namespace stream
 		}
 	}
 
-	void StreamingDestination::HandleNextPacket (Packet * packet)
+	void ClientDestination::ProcessGarlicMessage (I2NPMessage * msg)
 	{
-		uint32_t sendStreamID = packet->GetSendStreamID ();
-		if (sendStreamID)
-		{	
-			auto it = m_Streams.find (sendStreamID);
-			if (it != m_Streams.end ())
-				it->second->HandleNextPacket (packet);
-			else
-			{	
-				LogPrint ("Unknown stream ", sendStreamID);
-				delete packet;
-			}
-		}	
-		else // new incoming stream
-		{
-			auto incomingStream = CreateNewIncomingStream ();
-			incomingStream->HandleNextPacket (packet);
-			if (m_Acceptor != nullptr)
-				m_Acceptor (incomingStream);
-			else
-			{
-				LogPrint ("Acceptor for incoming stream is not set");
-				DeleteStream (incomingStream);
-			}
-		}	
-	}	
-
-	Stream * StreamingDestination::CreateNewOutgoingStream (const i2p::data::LeaseSet& remote)
-	{
-		Stream * s = new Stream (m_Service, *this, remote);
-		std::unique_lock<std::mutex> l(m_StreamsMutex);
-		m_Streams[s->GetRecvStreamID ()] = s;
-		return s;
-	}	
-
-	Stream * StreamingDestination::CreateNewIncomingStream ()
-	{
-		Stream * s = new Stream (m_Service, *this);
-		std::unique_lock<std::mutex> l(m_StreamsMutex);
-		m_Streams[s->GetRecvStreamID ()] = s;
-		return s;
+		m_Service->post (boost::bind (&ClientDestination::HandleGarlicMessage, this, msg)); 
 	}
 
-	void StreamingDestination::DeleteStream (Stream * stream)
+	void ClientDestination::ProcessDeliveryStatusMessage (I2NPMessage * msg)
 	{
-		if (stream)
+		m_Service->post (boost::bind (&ClientDestination::HandleDeliveryStatusMessage, this, msg)); 
+	}
+
+	void ClientDestination::HandleI2NPMessage (const uint8_t * buf, size_t len, i2p::tunnel::InboundTunnel * from)
+	{
+		I2NPHeader * header = (I2NPHeader *)buf;
+		switch (header->typeID)
 		{	
-			std::unique_lock<std::mutex> l(m_StreamsMutex);
-			auto it = m_Streams.find (stream->GetRecvStreamID ());
-			if (it != m_Streams.end ())
-			{	
-				m_Streams.erase (it);
-				delete stream;
-			}	
-		}	
+			case eI2NPData:
+				HandleDataMessage (buf + sizeof (I2NPHeader), be16toh (header->size));
+			break;
+			case eI2NPDatabaseStore:
+				HandleDatabaseStoreMessage (buf + sizeof (I2NPHeader), be16toh (header->size));
+				i2p::HandleI2NPMessage (CreateI2NPMessage (buf, GetI2NPMessageLength (buf), from)); // TODO: remove
+			break;	
+			default:
+				i2p::HandleI2NPMessage (CreateI2NPMessage (buf, GetI2NPMessageLength (buf), from));
+		}		
 	}	
 
-	const i2p::data::LeaseSet * StreamingDestination::GetLeaseSet ()
+	void ClientDestination::HandleDatabaseStoreMessage (const uint8_t * buf, size_t len)
 	{
-		if (!m_Pool) return nullptr;
-		if (!m_LeaseSet)
-			UpdateLeaseSet ();
-		return m_LeaseSet;
-	}	
-
-	void StreamingDestination::UpdateLeaseSet ()
-	{
-		auto newLeaseSet = new i2p::data::LeaseSet (*m_Pool);
-		if (!m_LeaseSet)
-			m_LeaseSet = newLeaseSet;
-		else
-		{	
-			// TODO: implement it better
-			*m_LeaseSet = *newLeaseSet;
-			delete newLeaseSet;
-		}	
-	}	
-	
-	void StreamingDestination::HandleDataMessage (const uint8_t * buf, size_t len)
-	{
-		uint32_t length = be32toh (*(uint32_t *)buf);
-		buf += 4;
-		// we assume I2CP payload
-		if (buf[9] == 6) // streaming protocol
-		{	
-			// unzip it
-			CryptoPP::Gunzip decompressor;
-			decompressor.Put (buf, length);
-			decompressor.MessageEnd();
-			Packet * uncompressed = new Packet;
-			uncompressed->offset = 0;
-			uncompressed->len = decompressor.MaxRetrievable ();
-			if (uncompressed->len <= MAX_PACKET_SIZE)
+		I2NPDatabaseStoreMsg * msg = (I2NPDatabaseStoreMsg *)buf;
+		size_t offset = sizeof (I2NPDatabaseStoreMsg);
+		if (msg->replyToken) // TODO:
+			offset += 36;
+		if (msg->type == 1) // LeaseSet
+		{
+			LogPrint ("Remote LeaseSet");
+			auto it = m_RemoteLeaseSets.find (msg->key);
+			if (it != m_RemoteLeaseSets.end ())
 			{
-				decompressor.Get (uncompressed->buf, uncompressed->len);
-				HandleNextPacket (uncompressed); 
+				it->second->Update (buf + offset, len - offset); 
+				LogPrint ("Remote LeaseSet updated");
 			}
 			else
-			{
-				LogPrint ("Received packet size ", uncompressed->len,  " exceeds max packet size. Skipped");
-				decompressor.Skip ();
-				delete uncompressed;
+			{	
+				LogPrint ("New remote LeaseSet added");
+				m_RemoteLeaseSets[msg->key] = new i2p::data::LeaseSet (buf + offset, len - offset);
 			}	
 		}	
 		else
-			LogPrint ("Data: unexpected protocol ", buf[9]);
+			LogPrint ("Unexpected client's DatabaseStore type ", msg->type, ". Dropped");
 	}	
-	
-	I2NPMessage * StreamingDestination::CreateDataMessage (const uint8_t * payload, size_t len)
-	{
-		I2NPMessage * msg = NewI2NPShortMessage ();
-		CryptoPP::Gzip compressor;
-		if (len <= COMPRESSION_THRESHOLD_SIZE)
-			compressor.SetDeflateLevel (CryptoPP::Gzip::MIN_DEFLATE_LEVEL);
-		else
-			compressor.SetDeflateLevel (CryptoPP::Gzip::DEFAULT_DEFLATE_LEVEL);
-		compressor.Put (payload, len);
-		compressor.MessageEnd();
-		int size = compressor.MaxRetrievable ();
-		uint8_t * buf = msg->GetPayload ();
-		*(uint32_t *)buf = htobe32 (size); // length
-		buf += 4;
-		compressor.Get (buf, size);
-		memset (buf + 4, 0, 4); // source and destination ports. TODO: fill with proper values later
-		buf[9] = 6; // streaming protocol
-		msg->len += size + 4; 
-		FillI2NPMessageHeader (msg, eI2NPData);
-		
-		return msg;
-	}		
 
-	void StreamingDestination::SetLeaseSetUpdated ()
+	void ClientDestination::SetLeaseSetUpdated ()
 	{
 		i2p::garlic::GarlicDestination::SetLeaseSetUpdated ();	
 		UpdateLeaseSet ();
 		if (m_IsPublic)
 			i2p::data::netdb.PublishLeaseSet (m_LeaseSet, m_Pool);
-	}	
-
-	void StreamingDestination::ProcessGarlicMessage (I2NPMessage * msg)
-	{
-		m_Service.post (boost::bind (&StreamingDestination::HandleGarlicMessage, this, msg)); 
 	}
 
-	void StreamingDestination::ProcessDeliveryStatusMessage (I2NPMessage * msg)
+	void ClientDestination::HandleDataMessage (const uint8_t * buf, size_t len)
 	{
-		m_Service.post (boost::bind (&StreamingDestination::HandleDeliveryStatusMessage, this, msg)); 
-	}
-
-	StreamingDestinations destinations;	
-	void StreamingDestinations::Start ()
-	{
-		if (!m_SharedLocalDestination)
-		{	
-			m_SharedLocalDestination = new StreamingDestination (false); // non-public
-			m_Destinations[m_SharedLocalDestination->GetIdentity ().GetIdentHash ()] = m_SharedLocalDestination;
-			m_SharedLocalDestination->Start ();
+		uint32_t length = be32toh (*(uint32_t *)buf);
+		buf += 4;
+		// we assume I2CP payload
+		switch (buf[9])
+		{
+			case PROTOCOL_TYPE_STREAMING:
+				// streaming protocol
+				if (m_StreamingDestination)
+					m_StreamingDestination->HandleDataMessagePayload (buf, length);
+				else
+					LogPrint ("Missing streaming destination");
+			break;
+			case PROTOCOL_TYPE_DATAGRAM:
+				// datagram protocol
+				if (m_DatagramDestination)
+					m_DatagramDestination->HandleDataMessagePayload (buf, length);
+				else
+					LogPrint ("Missing streaming destination");
+			break;
+			default:
+				LogPrint ("Data: unexpected protocol ", buf[9]);
 		}
-	}
-		
-	void StreamingDestinations::Stop ()
-	{
-		for (auto it: m_Destinations)
-		{	
-			it.second->Stop ();
-			delete it.second;
-		}		
-		m_Destinations.clear ();
-		m_SharedLocalDestination = 0; // deleted through m_Destination
 	}	
 
-	void StreamingDestinations::LoadLocalDestinations ()
+	i2p::stream::Stream * ClientDestination::CreateStream (const i2p::data::LeaseSet& remote, int port)
 	{
-		int numDestinations = 0;
-		boost::filesystem::path p (i2p::util::filesystem::GetDataDir());
-		boost::filesystem::directory_iterator end;
-		for (boost::filesystem::directory_iterator it (p); it != end; ++it)
-		{
-			if (boost::filesystem::is_regular_file (*it) && it->path ().extension () == ".dat")
-			{
-				auto fullPath =
-#if BOOST_VERSION > 10500
-				it->path().string();
-#else
-				it->path();
-#endif
-				auto localDestination = new StreamingDestination (fullPath, true);
-				m_Destinations[localDestination->GetIdentHash ()] = localDestination;
-				numDestinations++;
-			}	
-		}	
-		if (numDestinations > 0)
-			LogPrint (numDestinations, " local destinations loaded");
-	}	
-	
-	StreamingDestination * StreamingDestinations::LoadLocalDestination (const std::string& filename, bool isPublic)
-	{
-		auto localDestination = new StreamingDestination (i2p::util::filesystem::GetFullPath (filename), isPublic);
-		std::unique_lock<std::mutex> l(m_DestinationsMutex);	
-		m_Destinations[localDestination->GetIdentHash ()] = localDestination;
-		localDestination->Start ();
-		return localDestination;
-	}
-
-	StreamingDestination * StreamingDestinations::CreateNewLocalDestination (bool isPublic)
-	{
-		auto localDestination = new StreamingDestination (isPublic);
-		std::unique_lock<std::mutex> l(m_DestinationsMutex);
-		m_Destinations[localDestination->GetIdentHash ()] = localDestination;
-		localDestination->Start ();
-		return localDestination;
-	}
-
-	void StreamingDestinations::DeleteLocalDestination (StreamingDestination * destination)
-	{
-		if (!destination) return;
-		auto it = m_Destinations.find (destination->GetIdentHash ());
-		if (it != m_Destinations.end ())
-		{
-			auto d = it->second;
-			{
-				std::unique_lock<std::mutex> l(m_DestinationsMutex);
-				m_Destinations.erase (it);
-			}	
-			d->Stop ();
-			delete d;
-		}
-	}
-
-	StreamingDestination * StreamingDestinations::CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
-	{
-		auto it = m_Destinations.find (keys.GetPublic ().GetIdentHash ());
-		if (it != m_Destinations.end ())
-		{
-			LogPrint ("Local destination ", keys.GetPublic ().GetIdentHash ().ToBase32 (), ".b32.i2p exists");
-			return nullptr;
-		}	
-		auto localDestination = new StreamingDestination (keys, isPublic);
-		std::unique_lock<std::mutex> l(m_DestinationsMutex);
-		m_Destinations[keys.GetPublic ().GetIdentHash ()] = localDestination;
-		localDestination->Start ();
-		return localDestination;
-	}
-
-	Stream * StreamingDestinations::CreateClientStream (const i2p::data::LeaseSet& remote)
-	{
-		if (!m_SharedLocalDestination) return nullptr;
-		return m_SharedLocalDestination->CreateNewOutgoingStream (remote);
-	}
-
-	void StreamingDestinations::DeleteStream (Stream * stream)
-	{
-		if (stream)
-			stream->GetLocalDestination ().DeleteStream (stream);
-	}	
-	
-	StreamingDestination * StreamingDestinations::FindLocalDestination (const i2p::data::IdentHash& destination) const
-	{
-		auto it = m_Destinations.find (destination);
-		if (it != m_Destinations.end ())
-			return it->second;
-		return nullptr;
-	}	
-
-	Stream * CreateStream (const i2p::data::LeaseSet& remote)
-	{
-		return destinations.CreateClientStream (remote);
-	}
-		
-	void DeleteStream (Stream * stream)
-	{
-		destinations.DeleteStream (stream);
-	}	
-
-	void StartStreaming ()
-	{
-		destinations.Start ();
-	}
-		
-	void StopStreaming ()
-	{
-		destinations.Stop ();
-	}	
-
-	StreamingDestination * GetSharedLocalDestination ()
-	{
-		return destinations.GetSharedLocalDestination ();
-	}	
-	
-	StreamingDestination * CreateNewLocalDestination (bool isPublic)
-	{
-		return destinations.CreateNewLocalDestination (isPublic);
-	}
-
-	StreamingDestination * CreateNewLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
-	{
-		return destinations.CreateNewLocalDestination (keys, isPublic);
-	}
-
-	void DeleteLocalDestination (StreamingDestination * destination)
-	{
-		destinations.DeleteLocalDestination (destination);
-	}
-
-	StreamingDestination * FindLocalDestination (const i2p::data::IdentHash& destination)
-	{
-		return destinations.FindLocalDestination (destination);
-	}
-
-	StreamingDestination * LoadLocalDestination (const std::string& filename, bool isPublic)
-	{
-		return destinations.LoadLocalDestination (filename, isPublic);
+		if (m_StreamingDestination)
+			return m_StreamingDestination->CreateNewOutgoingStream (remote, port);
+		return nullptr;	
 	}		
 
-	const StreamingDestinations& GetLocalDestinations ()
+	void ClientDestination::AcceptStreams (const std::function<void (i2p::stream::Stream *)>& acceptor)
 	{
-		return destinations;
+		if (m_StreamingDestination)
+			m_StreamingDestination->SetAcceptor (acceptor);
+	}
+
+	void ClientDestination::StopAcceptingStreams ()
+	{
+		if (m_StreamingDestination)
+			m_StreamingDestination->ResetAcceptor ();
+	}
+
+	bool ClientDestination::IsAcceptingStreams () const
+	{
+		if (m_StreamingDestination)
+			return m_StreamingDestination->IsAcceptorSet ();
+		return false;
 	}	
-}		
+
+	void ClientDestination::CreateDatagramDestination ()
+	{
+		if (!m_DatagramDestination)
+			m_DatagramDestination = new i2p::datagram::DatagramDestination (*this);
+	}
+}
 }

@@ -35,6 +35,8 @@ namespace data
 			operator uint8_t * () { return m_Buf; };
 			operator const uint8_t * () const { return m_Buf; };
 			
+			const uint64_t * GetLL () const { return ll; };
+
 			bool operator== (const Tag<sz>& other) const { return !memcmp (m_Buf, other.m_Buf, sz); };
 			bool operator< (const Tag<sz>& other) const { return memcmp (m_Buf, other.m_Buf, sz) < 0; };
 
@@ -52,7 +54,7 @@ namespace data
 				int l = i2p::data::ByteStreamToBase32 (m_Buf, sz, str, sz*2);
 				str[l] = 0;
 				return std::string (str);
-			}
+			}	
 
 		private:
 
@@ -65,13 +67,6 @@ namespace data
 	typedef Tag<32> IdentHash;
 
 #pragma pack(1)
-
-	struct DHKeysPair // transient keys for transport sessions
-	{
-		uint8_t publicKey[256];
-		uint8_t privateKey[256];
-	};	
-
 	struct Keys
 	{
 		uint8_t privateKey[256];
@@ -79,7 +74,6 @@ namespace data
 		uint8_t publicKey[256];
 		uint8_t signingKey[128];
 	};
-	
 	
 	const uint8_t CERTIFICATE_TYPE_NULL = 0;
 	const uint8_t CERTIFICATE_TYPE_HASHCASH = 1;
@@ -103,7 +97,10 @@ namespace data
 		Identity& operator=(const Keys& keys);
 		size_t FromBuffer (const uint8_t * buf, size_t len);
 		IdentHash Hash () const;
-	};	
+	};
+#pragma pack()
+	Keys CreateRandomKeys ();
+	
 	const size_t DEFAULT_IDENTITY_SIZE = sizeof (Identity); // 387 bytes
 
 	const uint16_t CRYPTO_KEY_TYPE_ELGAMAL = 0;
@@ -181,19 +178,8 @@ namespace data
 			uint8_t m_SigningPrivateKey[128]; // assume private key doesn't exceed 128 bytes
 			i2p::crypto::Signer * m_Signer;
 	};
-	
-#pragma pack()
-		
-	Keys CreateRandomKeys ();
-	void CreateRandomDHKeysPair (DHKeysPair * keys); // for transport sessions
 
 	// kademlia
-	union RoutingKey
-	{
-		uint8_t hash[32];
-		uint64_t hash_ll[4];
-	};	
-
 	struct XORMetric
 	{
 		union
@@ -207,8 +193,8 @@ namespace data
 		bool operator< (const XORMetric& other) const { return memcmp (metric, other.metric, 32) < 0; };
 	};	
 
-	RoutingKey CreateRoutingKey (const IdentHash& ident);
-	XORMetric operator^(const RoutingKey& key1, const RoutingKey& key2); 	
+	IdentHash CreateRoutingKey (const IdentHash& ident);
+	XORMetric operator^(const IdentHash& key1, const IdentHash& key2); 	
 	
 	// destination for delivery instuctions
 	class RoutingDestination
@@ -242,7 +228,6 @@ namespace data
 			virtual const PrivateKeys& GetPrivateKeys () const = 0;
 			virtual const uint8_t * GetEncryptionPrivateKey () const = 0; 
 			virtual const uint8_t * GetEncryptionPublicKey () const = 0; 
-			virtual void HandleDataMessage (const uint8_t * buf, size_t len) = 0;
 
 			const IdentityEx& GetIdentity () const { return GetPrivateKeys ().GetPublic (); };
 			const IdentHash& GetIdentHash () const { return GetIdentity ().GetIdentHash (); };  

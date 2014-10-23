@@ -33,7 +33,7 @@ namespace tunnel
 			const uint8_t * GetEncryptionPublicKey () const { return m_LocalDestination.GetEncryptionPublicKey (); };
 			const i2p::data::LocalDestination& GetLocalDestination () const { return m_LocalDestination; };			
 			i2p::garlic::GarlicDestination& GetGarlicDestination () const { return m_LocalDestination; };	
-			bool IsExploratory () const { return GetIdentHash () == i2p::context.GetRouterIdentHash (); };		
+			bool IsExploratory () const { return GetIdentHash () == i2p::context.GetIdentHash (); };		
 
 			void CreateTunnels ();
 			void TunnelCreated (InboundTunnel * createdTunnel);
@@ -48,6 +48,10 @@ namespace tunnel
 			void TestTunnels ();
 			void ProcessDeliveryStatus (I2NPMessage * msg);
 
+			bool IsActive () const { return m_IsActive; };
+			void SetActive (bool isActive) { m_IsActive = isActive; };
+			void DetachTunnels ();
+			
 		private:
 
 			void CreateInboundTunnel ();	
@@ -68,6 +72,7 @@ namespace tunnel
 			mutable std::mutex m_OutboundTunnelsMutex;
 			std::set<OutboundTunnel *, TunnelCreationTimeCmp> m_OutboundTunnels;
 			std::map<uint32_t, std::pair<OutboundTunnel *, InboundTunnel *> > m_Tests;
+			bool m_IsActive;
 
 		public:
 

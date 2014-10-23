@@ -10,6 +10,7 @@
 #include "Streaming.h"
 #include "Destination.h"
 #include "RouterContext.h"
+#include "ClientContext.h"
 #include "HTTPServer.h"
 
 // For image and info
@@ -516,11 +517,11 @@ namespace util
 		if (m_Stream)
 		{
 			m_Stream->Close ();
-			DeleteStream (m_Stream);
+			i2p::stream::DeleteStream (m_Stream);
 			m_Stream = nullptr;
 		}
 		m_Socket->close ();
-		delete this;
+		//delete this;
 	}
 
 	void HTTPConnection::Receive ()
@@ -623,7 +624,7 @@ namespace util
 		s << "<head><meta charset=\"utf-8\" />"; // TODO: Find something to parse html/template system. This is horrible.
 		s << "<link rel='shortcut icon' href='";
 		s << itoopieFavicon;
-		s << "' /><title>Purple I2P Webconsole</title></head>";
+		s << "' /><title>Purple I2P " << VERSION " Webconsole</title></head>";
 		// Head end
 		if (address.length () > 1)
 			HandleCommand (address.substr (2), s);
@@ -698,7 +699,7 @@ namespace util
 	void HTTPConnection::ShowTransports (std::stringstream& s)
 	{
 		s << "NTCP<br>";
-		for (auto it: i2p::transports.GetNTCPSessions ())
+		for (auto it: i2p::transport::transports.GetNTCPSessions ())
 		{
 			// RouterInfo of incoming connection doesn't have address
 			bool outgoing = it.second->GetRemoteRouterInfo ().GetNTCPAddress ();
@@ -713,7 +714,7 @@ namespace util
 			}
 			s << std::endl;
 		}
-		auto ssuServer = i2p::transports.GetSSUServer ();
+		auto ssuServer = i2p::transport::transports.GetSSUServer ();
 		if (ssuServer)
 		{
 			s << "<br>SSU<br>";
@@ -779,7 +780,7 @@ namespace util
 
 	void HTTPConnection::ShowLocalDestinations (std::stringstream& s)
 	{
-		for (auto& it: i2p::stream::GetLocalDestinations ().GetDestinations ())
+		for (auto& it: i2p::client::context.GetDestinations ())
 		{
 			std::string b32 = it.first.ToBase32 (); 
 			s << "<a href=/?" << HTTP_COMMAND_LOCAL_DESTINATION;
@@ -792,12 +793,14 @@ namespace util
 	{
 		i2p::data::IdentHash ident;
 		i2p::data::Base32ToByteStream (b32.c_str (), b32.length (), ident, 32);
-		auto dest = i2p::stream::FindLocalDestination (ident);
+		auto dest = i2p::client::context.FindLocalDestination (ident);
 		if (dest)
 		{
+			s << "<b>LeaseSets:</b> <i>" << dest->GetNumRemoteLeaseSets () << "</i><br>";
 			auto pool = dest->GetTunnelPool ();
 			if (pool)
 			{
+				s << "<b>Tunnels:</b><br>";
 				for (auto it: pool->GetOutboundTunnels ())
 				{
 					it->GetTunnelConfig ()->Print (s);
@@ -808,6 +811,14 @@ namespace util
 					it->GetTunnelConfig ()->Print (s);
 					s << "<br>" << std::endl;
 				}
+			}	
+			s << "<br><b>Streams:</b><br>";
+			for (auto it: dest->GetStreamingDestination ()->GetStreams ())
+			{	
+				s << it.first << "->" << it.second->GetRemoteIdentity ().GetIdentHash ().ToBase32 () << ".b32.i2p ";
+				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
+				s << " [out:" << it.second->GetSendQueueSize () << "][in:" << it.second->GetReceiveQueueSize () << "]";
+				s << "<br>"<< std::endl; 
 			}	
 		}	
 	}	
@@ -828,10 +839,10 @@ namespace util
 	{
 		std::string request = "GET " + uri + " HTTP/1.1\r\nHost:" + address + "\r\n";
 		LogPrint("HTTP Client Request: ", request);
-		SendToAddress (address, request.c_str (), request.size ());		
+		SendToAddress (address, 80, request.c_str (), request.size ());		
 	}
 
-	void HTTPConnection::SendToAddress (const std::string& address, const char * buf, size_t len)
+	void HTTPConnection::SendToAddress (const std::string& address, int port, const char * buf, size_t len)
 	{	
 		i2p::data::IdentHash destination;
 		if (!i2p::data::netdb.GetAddressBook ().GetIdentHash (address, destination))
@@ -841,32 +852,43 @@ namespace util
 			return;
 		}		
 
-		SendToDestination (destination, buf, len);
+		auto leaseSet = i2p::client::context.GetSharedLocalDestination ()->FindLeaseSet (destination);
+		if (leaseSet && leaseSet->HasNonExpiredLeases ())
+			SendToDestination (leaseSet, port, buf, len);
+		else
+		{
+			i2p::data::netdb.RequestDestination (destination, true, i2p::client::context.GetSharedLocalDestination ()->GetTunnelPool ());
+			m_Timer.expires_from_now (boost::posix_time::seconds(HTTP_DESTINATION_REQUEST_TIMEOUT));
+			m_Timer.async_wait (boost::bind (&HTTPConnection::HandleDestinationRequestTimeout,
+				this, boost::asio::placeholders::error, destination, port, buf, len));
+		}
 	}
 	
-	void HTTPConnection::SendToDestination (const i2p::data::IdentHash& destination, const char * buf, size_t len)
-	{
-		auto leaseSet = i2p::data::netdb.FindLeaseSet (destination);
-		if (!leaseSet || !leaseSet->HasNonExpiredLeases ())
-		{
-			i2p::data::netdb.Subscribe(destination, i2p::stream::GetSharedLocalDestination ()->GetTunnelPool ());
-			std::this_thread::sleep_for (std::chrono::seconds(10)); // wait for 10 seconds
-			leaseSet = i2p::data::netdb.FindLeaseSet (destination);
-			if (!leaseSet || !leaseSet->HasNonExpiredLeases ()) // still no LeaseSet
-			{
+	void HTTPConnection::HandleDestinationRequestTimeout (const boost::system::error_code& ecode, 
+		i2p::data::IdentHash destination, int port, const char * buf, size_t len)
+	{	
+		if (ecode != boost::asio::error::operation_aborted)
+		{	
+			auto leaseSet = i2p::client::context.GetSharedLocalDestination ()->FindLeaseSet (destination);
+			if (leaseSet && leaseSet->HasNonExpiredLeases ())
+				SendToDestination (leaseSet, port, buf, len);
+			else
+				// still no LeaseSet
 				SendReply (leaseSet ? "<html>" + itoopieImage + "<br>Leases expired</html>" : "<html>" + itoopieImage + "LeaseSet not found</html>", 504);
-				return;
-			}
 		}
+	}	
+	
+	void HTTPConnection::SendToDestination (const i2p::data::LeaseSet * remote, int port, const char * buf, size_t len)
+	{
 		if (!m_Stream)
-			m_Stream = i2p::stream::CreateStream (*leaseSet);
+			m_Stream = i2p::client::context.GetSharedLocalDestination ()->CreateStream (*remote, port);
 		if (m_Stream)
 		{
 			m_Stream->Send ((uint8_t *)buf, len);
 			AsyncStreamReceive ();
 		}
-	}	
-	
+	}
+
 	void HTTPConnection::AsyncStreamReceive ()
 	{
 		if (m_Stream)

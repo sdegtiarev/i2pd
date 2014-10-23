@@ -18,6 +18,10 @@
 
 namespace i2p
 {
+namespace client
+{
+	class ClientDestination;
+}
 namespace stream
 {
 	const uint16_t PACKET_FLAG_SYNCHRONIZE = 0x0001;
@@ -36,6 +40,7 @@ namespace stream
 	const size_t MAX_PACKET_SIZE = 4096;
 	const size_t COMPRESSION_THRESHOLD_SIZE = 66;	
 	const int RESEND_TIMEOUT = 10; // in seconds
+	const int ACK_SEND_TIMEOUT = 200; // in milliseconds
 	const int MAX_NUM_RESEND_ATTEMPTS = 5;	
 	
 	struct Packet
@@ -77,7 +82,8 @@ namespace stream
 	{	
 		public:
 
-			Stream (boost::asio::io_service& service, StreamingDestination& local, const i2p::data::LeaseSet& remote); // outgoing
+			Stream (boost::asio::io_service& service, StreamingDestination& local, 
+				const i2p::data::LeaseSet& remote, int port = 0); // outgoing
 			Stream (boost::asio::io_service& service, StreamingDestination& local); // incoming			
 
 			~Stream ();
@@ -96,7 +102,12 @@ namespace stream
 			void AsyncReceive (const Buffer& buffer, ReceiveHandler handler, int timeout = 0);
 
 			void Close ();
-	
+
+			size_t GetNumSentBytes () const { return m_NumSentBytes; };
+			size_t GetNumReceivedBytes () const { return m_NumReceivedBytes; };
+			size_t GetSendQueueSize () const { return m_SentPackets.size (); };
+			size_t GetReceiveQueueSize () const { return m_ReceiveQueue.size (); };
+			
 		private:
 
 			void SendQuickAck ();
@@ -115,13 +126,16 @@ namespace stream
 
 			void ScheduleResend ();
 			void HandleResendTimer (const boost::system::error_code& ecode);
+			void HandleAckSendTimer (const boost::system::error_code& ecode);
+
+			I2NPMessage * CreateDataMessage (const uint8_t * payload, size_t len);
 			
 		private:
 
 			boost::asio::io_service& m_Service;
 			uint32_t m_SendStreamID, m_RecvStreamID, m_SequenceNumber;
 			int32_t m_LastReceivedSequenceNumber;
-			bool m_IsOpen, m_IsReset;
+			bool m_IsOpen, m_IsReset, m_IsAckSendScheduled;
 			StreamingDestination& m_LocalDestination;
 			i2p::data::IdentityEx m_RemoteIdentity;
 			const i2p::data::LeaseSet * m_RemoteLeaseSet;
@@ -130,8 +144,49 @@ namespace stream
 			std::queue<Packet *> m_ReceiveQueue;
 			std::set<Packet *, PacketCmp> m_SavedPackets;
 			std::set<Packet *, PacketCmp> m_SentPackets;
-			boost::asio::deadline_timer m_ReceiveTimer, m_ResendTimer;
+			boost::asio::deadline_timer m_ReceiveTimer, m_ResendTimer, m_AckSendTimer;
+			size_t m_NumSentBytes, m_NumReceivedBytes;
+			uint16_t m_Port;
 	};
+
+	class StreamingDestination
+	{
+		public:
+
+			StreamingDestination (i2p::client::ClientDestination& owner): m_Owner (owner) {};
+			~StreamingDestination () {};	
+
+			void Start ();
+			void Stop ();
+
+			Stream * CreateNewOutgoingStream (const i2p::data::LeaseSet& remote, int port = 0);
+			void DeleteStream (Stream * stream);			
+			void SetAcceptor (const std::function<void (Stream *)>& acceptor) { m_Acceptor = acceptor; };
+			void ResetAcceptor () { m_Acceptor = nullptr; };
+			bool IsAcceptorSet () const { return m_Acceptor != nullptr; };	
+			i2p::client::ClientDestination& GetOwner () { return m_Owner; };
+
+			void HandleDataMessagePayload (const uint8_t * buf, size_t len);
+
+		private:		
+	
+			void HandleNextPacket (Packet * packet);
+			Stream * CreateNewIncomingStream ();
+
+		private:
+
+			i2p::client::ClientDestination& m_Owner;
+			std::mutex m_StreamsMutex;
+			std::map<uint32_t, Stream *> m_Streams;
+			std::function<void (Stream *)> m_Acceptor;
+			
+		public:
+
+			// for HTTP only
+			const decltype(m_Streams)& GetStreams () const { return m_Streams; };
+	};		
+
+	void DeleteStream (Stream * stream);
 
 //-------------------------------------------------
 

@@ -1,5 +1,7 @@
+#include <cryptopp/dh.h>
 #include <boost/bind.hpp>
 #include "Log.h"
+#include "CryptoConst.h"
 #include "RouterContext.h"
 #include "I2NPProtocol.h"
 #include "NetDb.h"
@@ -9,6 +11,13 @@ using namespace i2p::data;
 
 namespace i2p
 {
+namespace transport
+{
+	DHKeysPairSupplier::DHKeysPairSupplier (int size):
+		m_QueueSize (size), m_IsRunning (false), m_Thread (nullptr)
+	{
+	}	
+
 	DHKeysPairSupplier::~DHKeysPairSupplier ()
 	{
 		Stop ();
@@ -48,17 +57,18 @@ namespace i2p
 	{
 		if (num > 0)
 		{
+			CryptoPP::DH dh (i2p::crypto::elgp, i2p::crypto::elgg);
 			for (int i = 0; i < num; i++)
 			{
-				i2p::data::DHKeysPair * pair = new i2p::data::DHKeysPair ();
-				i2p::data::CreateRandomDHKeysPair (pair);
+				i2p::transport::DHKeysPair * pair = new i2p::transport::DHKeysPair ();
+				dh.GenerateKeyPair(m_Rnd, pair->privateKey, pair->publicKey);
 				std::unique_lock<std::mutex>  l(m_AcquiredMutex);
 				m_Queue.push (pair);
 			}
 		}
 	}
 
-	i2p::data::DHKeysPair * DHKeysPairSupplier::Acquire ()
+	DHKeysPair * DHKeysPairSupplier::Acquire ()
 	{
 		if (!m_Queue.empty ())
 		{
@@ -70,13 +80,14 @@ namespace i2p
 		}	
 		else // queue is empty, create new
 		{
-			i2p::data::DHKeysPair * pair = new i2p::data::DHKeysPair ();
-			i2p::data::CreateRandomDHKeysPair (pair);
+			DHKeysPair * pair = new DHKeysPair ();
+			CryptoPP::DH dh (i2p::crypto::elgp, i2p::crypto::elgg);
+			dh.GenerateKeyPair(m_Rnd, pair->privateKey, pair->publicKey);
 			return pair;
 		}
 	}
 
-	void DHKeysPairSupplier::Return (i2p::data::DHKeysPair * pair)
+	void DHKeysPairSupplier::Return (DHKeysPair * pair)
 	{
 		std::unique_lock<std::mutex>  l(m_AcquiredMutex);
 		m_Queue.push (pair);
@@ -110,7 +121,7 @@ namespace i2p
 					boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), address.port));
 
 				LogPrint ("Start listening TCP port ", address.port);	
-				auto conn = new i2p::ntcp::NTCPServerConnection (m_Service);
+				auto conn = new NTCPServerConnection (m_Service);
 				m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
 					conn, boost::asio::placeholders::error));
 			}	
@@ -118,7 +129,7 @@ namespace i2p
 			{
 				if (!m_SSUServer)
 				{	
-					m_SSUServer = new i2p::ssu::SSUServer (address.port);
+					m_SSUServer = new SSUServer (address.port);
 					LogPrint ("Start listening UDP port ", address.port);
 					m_SSUServer->Start ();	
 					DetectExternalIP ();
@@ -170,19 +181,19 @@ namespace i2p
 		}	
 	}
 		
-	void Transports::AddNTCPSession (i2p::ntcp::NTCPSession * session)
+	void Transports::AddNTCPSession (NTCPSession * session)
 	{
 		if (session)
 			m_NTCPSessions[session->GetRemoteRouterInfo ().GetIdentHash ()] = session;
 	}	
 
-	void Transports::RemoveNTCPSession (i2p::ntcp::NTCPSession * session)
+	void Transports::RemoveNTCPSession (NTCPSession * session)
 	{
 		if (session)
 			m_NTCPSessions.erase (session->GetRemoteRouterInfo ().GetIdentHash ());
 	}	
 		
-	void Transports::HandleAccept (i2p::ntcp::NTCPServerConnection * conn, const boost::system::error_code& error)
+	void Transports::HandleAccept (NTCPServerConnection * conn, const boost::system::error_code& error)
 	{		
 		if (!error)
 		{
@@ -194,13 +205,13 @@ namespace i2p
 
 		if (error != boost::asio::error::operation_aborted)
 		{
-    		conn = new i2p::ntcp::NTCPServerConnection (m_Service);
+    		conn = new NTCPServerConnection (m_Service);
 			m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
 				conn, boost::asio::placeholders::error));
 		}	
 	}
 
-	i2p::ntcp::NTCPSession * Transports::GetNextNTCPSession ()
+	NTCPSession * Transports::GetNextNTCPSession ()
 	{
 		for (auto session: m_NTCPSessions)
 			if (session.second->IsEstablished ())
@@ -208,7 +219,7 @@ namespace i2p
 		return 0;
 	}	
 
-	i2p::ntcp::NTCPSession * Transports::FindNTCPSession (const i2p::data::IdentHash& ident)
+	NTCPSession * Transports::FindNTCPSession (const i2p::data::IdentHash& ident)
 	{
 		auto it = m_NTCPSessions.find (ident);
 		if (it != m_NTCPSessions.end ())
@@ -243,9 +254,9 @@ namespace i2p
 					// existing session not found. create new 
 					// try NTCP first if message size < 16K
 					auto address = r->GetNTCPAddress ();
-					if (address && !r->UsesIntroducer () && !r->IsUnreachable () && msg->GetLength () < i2p::ntcp::NTCP_MAX_MESSAGE_SIZE)
+					if (address && !r->UsesIntroducer () && !r->IsUnreachable () && msg->GetLength () < NTCP_MAX_MESSAGE_SIZE)
 					{	
-						auto s = new i2p::ntcp::NTCPClient (m_Service, address->host, address->port, *r);
+						auto s = new NTCPClient (m_Service, address->host, address->port, *r);
 						AddNTCPSession (s);
 						s->SendI2NPMessage (msg);
 					}	
@@ -318,15 +329,16 @@ namespace i2p
 				m_SSUServer->GetSession (router, true);  // peer test	
 		}	
 	}
-		
-		
-	i2p::data::DHKeysPair * Transports::GetNextDHKeysPair ()
+			
+	DHKeysPair * Transports::GetNextDHKeysPair ()
 	{
 		return m_DHKeysPairSupplier.Acquire ();
 	}
 
-	void Transports::ReuseDHKeysPair (i2p::data::DHKeysPair * pair)
+	void Transports::ReuseDHKeysPair (DHKeysPair * pair)
 	{
 		m_DHKeysPairSupplier.Return (pair);
 	}
 }
+}
+

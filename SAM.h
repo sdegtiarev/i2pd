@@ -11,15 +11,17 @@
 #include "Identity.h"
 #include "LeaseSet.h"
 #include "Streaming.h"
+#include "Destination.h"
 
 namespace i2p
 {
-namespace stream
+namespace client
 {
 	const size_t SAM_SOCKET_BUFFER_SIZE = 4096;
 	const int SAM_SOCKET_CONNECTION_MAX_IDLE = 3600; // in seconds	
 	const int SAM_CONNECT_TIMEOUT = 5; // in seconds
 	const int SAM_NAMING_LOOKUP_TIMEOUT = 5; // in seconds
+	const int SAM_SESSION_READINESS_CHECK_INTERVAL = 20; // in seconds	
 	const char SAM_HANDSHAKE[] = "HELLO VERSION";
 	const char SAM_HANDSHAKE_REPLY[] = "HELLO REPLY RESULT=OK VERSION=3.0\n";
 	const char SAM_SESSION_CREATE[] = "SESSION CREATE";
@@ -45,6 +47,9 @@ namespace stream
 	const char SAM_PARAM_DESTINATION[] = "DESTINATION";	
 	const char SAM_PARAM_NAME[] = "NAME";		
 	const char SAM_VALUE_TRANSIENT[] = "TRANSIENT";	
+	const char SAM_VALUE_STREAM[] = "STREAM";
+	const char SAM_VALUE_DATAGRAM[] = "DATAGRAM";
+	const char SAM_VALUE_RAW[] = "RAW";	
 	const char SAM_VALUE_TRUE[] = "true";	
 	const char SAM_VALUE_FALSE[] = "false";	
 
@@ -94,7 +99,9 @@ namespace stream
 			void Connect (const i2p::data::LeaseSet& remote);
 			void HandleStreamDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident);
 			void HandleNamingLookupDestinationRequestTimer (const boost::system::error_code& ecode, i2p::data::IdentHash ident);
-			void SendNamingLookupReply (i2p::data::LeaseSet * leaseSet);
+			void SendNamingLookupReply (const i2p::data::LeaseSet * leaseSet);
+			void HandleSessionReadinessCheckTimer (const boost::system::error_code& ecode);
+			void SendSessionCreateReplyOk ();
 
 		private:
 
@@ -106,13 +113,13 @@ namespace stream
 			SAMSocketType m_SocketType;
 			std::string m_ID; // nickname
 			bool m_IsSilent;
-			Stream * m_Stream;
+			i2p::stream::Stream * m_Stream;
 			SAMSession * m_Session;
 	};	
 
 	struct SAMSession
 	{
-		StreamingDestination * localDestination;
+		ClientDestination * localDestination;
 		std::list<SAMSocket *> sockets;
 	};
 
@@ -138,15 +145,21 @@ namespace stream
 			void Accept ();
 			void HandleAccept(const boost::system::error_code& ecode);
 
+			void ReceiveDatagram ();
+			void HandleReceivedDatagram (const boost::system::error_code& ecode, std::size_t bytes_transferred);
+
 		private:
 
 			bool m_IsRunning;
 			std::thread * m_Thread;	
 			boost::asio::io_service m_Service;
 			boost::asio::ip::tcp::acceptor m_Acceptor;
+			boost::asio::ip::udp::endpoint m_DatagramEndpoint, m_SenderEndpoint;
+			boost::asio::ip::udp::socket m_DatagramSocket;
 			SAMSocket * m_NewSocket;
 			std::mutex m_SessionsMutex;
 			std::map<std::string, SAMSession> m_Sessions;
+			uint8_t m_DatagramReceiveBuffer[i2p::datagram::MAX_DATAGRAM_SIZE];
 	};		
 }
 }
