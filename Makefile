@@ -7,6 +7,7 @@ else ifeq ($(UNAME), FreeBSD)
 else
 	include Makefile.linux
 endif
+CXXFLAGS= $(CFLAGS)
 
 all: obj i2p
 
@@ -24,6 +25,16 @@ obj:
 
 clean:
 	rm -fr obj i2p
+	
+io: io.cc
+	g++ -g -std=c++11 io.cc -o io -lboost_system
+
+ios: ios.cc
+	g++ -g -std=c++11 $< -o$@ -lboost_system
+
 
 .PHONY: all
 .PHONY: clean
+
+ver:
+	@echo $(CXXVER) flags: $(CFLAGS)
