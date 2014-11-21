@@ -21,7 +21,7 @@ namespace i2p
 {
 namespace data
 {		
-	I2NPMessage * RequestedDestination::CreateRequestMessage (const RouterInfo * router,
+	I2NPMessage * RequestedDestination::CreateRequestMessage (std::shared_ptr<const RouterInfo> router,
 		const i2p::tunnel::InboundTunnel * replyTunnel)
 	{
 		I2NPMessage * msg = i2p::CreateDatabaseLookupMsg (m_Destination, 
@@ -71,8 +71,6 @@ namespace data
 		Stop ();	
 		for (auto l:m_LeaseSets)
 			delete l.second;
-		for (auto r:m_RouterInfos)
-			delete r.second;
 		for (auto r:m_RequestedDestinations)
 			delete r.second;
 	}	
@@ -169,24 +167,27 @@ namespace data
 	
 	void NetDb::AddRouterInfo (const IdentHash& ident, const uint8_t * buf, int len)
 	{	
-		DeleteRequestedDestination (ident);
-		auto it = m_RouterInfos.find(ident);
-		if (it != m_RouterInfos.end ())
+		DeleteRequestedDestination (ident);	
+		auto r = FindRouter (ident);
+		if (r)
 		{
-			auto ts = it->second->GetTimestamp ();
-			it->second->Update (buf, len);
-			if (it->second->GetTimestamp () > ts)
+			auto ts = r->GetTimestamp ();
+			r->Update (buf, len);
+			if (r->GetTimestamp () > ts)
 				LogPrint ("RouterInfo updated");
 		}	
 		else	
 		{	
 			LogPrint ("New RouterInfo added");
-			RouterInfo * r = new RouterInfo (buf, len);
-			m_RouterInfos[r->GetIdentHash ()] = r;
-			if (r->IsFloodfill ())
+			auto newRouter = std::make_shared<RouterInfo> (buf, len);
+			{
+				std::unique_lock<std::mutex> l(m_RouterInfosMutex);
+				m_RouterInfos[newRouter->GetIdentHash ()] = newRouter;
+			}
+			if (newRouter->IsFloodfill ())
 			{
 				std::unique_lock<std::mutex> l(m_FloodfillsMutex);
-				m_Floodfills.push_back (r);
+				m_Floodfills.push_back (newRouter);
 			}	
 		}	
 	}	
@@ -211,8 +212,9 @@ namespace data
 		}	
 	}	
 
-	RouterInfo * NetDb::FindRouter (const IdentHash& ident) const
+	std::shared_ptr<RouterInfo> NetDb::FindRouter (const IdentHash& ident) const
 	{
+		std::unique_lock<std::mutex> l(m_RouterInfosMutex);
 		auto it = m_RouterInfos.find (ident);
 		if (it != m_RouterInfos.end ())
 			return it->second;
@@ -227,6 +229,13 @@ namespace data
 			return it->second;
 		else
 			return nullptr;
+	}
+
+	void NetDb::SetUnreachable (const IdentHash& ident, bool unreachable)
+	{
+		auto it = m_RouterInfos.find (ident);
+		if (it != m_RouterInfos.end ())
+			return it->second->SetUnreachable (unreachable);
 	}
 
 	// TODO: Move to reseed and/or scheduled tasks. (In java version, scheduler fix this as well as sort RIs.)
@@ -264,8 +273,6 @@ namespace data
 			if (!CreateNetDb(p)) return;
 		}
 		// make sure we cleanup netDb from previous attempts
-		for (auto r: m_RouterInfos)
-			delete r.second;
 		m_RouterInfos.clear ();	
 		m_Floodfills.clear ();	
 
@@ -284,7 +291,7 @@ namespace data
 #else
 					const std::string& fullPath = it1->path();
 #endif
-					RouterInfo * r = new RouterInfo(fullPath);
+					auto r = std::make_shared<RouterInfo>(fullPath);
 					if (!r->IsUnreachable () && (!r->UsesIntroducer () || ts < r->GetTimestamp () + 3600*1000LL)) // 1 hour
 					{	
 						r->DeleteBuffer ();
@@ -297,7 +304,6 @@ namespace data
 					{	
 						if (boost::filesystem::exists (fullPath))  
 							boost::filesystem::remove (fullPath);
-						delete r;
 					}	
 				}	
 			}	
@@ -334,7 +340,7 @@ namespace data
 		{	
 			if (it.second->IsUpdated ())
 			{
-				it.second->SaveToFile (GetFilePath(fullDirectory, it.second));
+				it.second->SaveToFile (GetFilePath(fullDirectory, it.second.get ()));
 				it.second->SetUpdated (false);
 				it.second->DeleteBuffer ();
 				count++;
@@ -352,18 +358,36 @@ namespace data
 				
 				if (it.second->IsUnreachable ())
 				{	
-					if (boost::filesystem::exists (GetFilePath (fullDirectory, it.second)))
+					// delete RI file
+					if (boost::filesystem::exists (GetFilePath (fullDirectory, it.second.get ())))
 					{    
-						boost::filesystem::remove (GetFilePath (fullDirectory, it.second));
+						boost::filesystem::remove (GetFilePath (fullDirectory, it.second.get ()));
 						deletedCount++;
 					}	
+					// delete from floodfills list
+					if (it.second->IsFloodfill ())
+					{
+						std::unique_lock<std::mutex> l(m_FloodfillsMutex);
+						m_Floodfills.remove (it.second);
+					}
 				}
 			}	
 		}	
 		if (count > 0)
 			LogPrint (count," new/updated routers saved");
 		if (deletedCount > 0)
+		{
 			LogPrint (deletedCount," routers deleted");
+			// clean up RouterInfos table
+			std::unique_lock<std::mutex> l(m_RouterInfosMutex);
+			for (auto it = m_RouterInfos.begin (); it != m_RouterInfos.end ();)
+			{
+				if (it->second->IsUnreachable ())
+					it = m_RouterInfos.erase (it);
+				else
+					it++;
+			}
+		}
 	}
 
 	void NetDb::RequestDestination (const IdentHash& destination, bool isLeaseSet, i2p::tunnel::TunnelPool * pool)
@@ -609,7 +633,7 @@ namespace data
 				LogPrint ("Requested RouterInfo ", key, " found");
 				router->LoadBuffer ();
 				if (router->GetBuffer ()) 
-					replyMsg = CreateDatabaseStoreMsg (router);
+					replyMsg = CreateDatabaseStoreMsg (router.get ());
 			}
 		}
 		if (!replyMsg)
@@ -631,7 +655,7 @@ namespace data
 				excludedRouters.insert (excluded);
 				excluded += 32;
 			}	
-			replyMsg = CreateDatabaseSearchReply (buf, GetClosestFloodfill (buf, excludedRouters));
+			replyMsg = CreateDatabaseSearchReply (buf, GetClosestFloodfill (buf, excludedRouters).get ());
 		}
 		else
 			excluded += numExcluded*32; // we don't care about exluded	
@@ -695,9 +719,9 @@ namespace data
 			rnd.GenerateBlock (randomHash, 32);
 			RequestedDestination * dest = CreateRequestedDestination (IdentHash (randomHash), false, true, exploratoryPool);
 			auto floodfill = GetClosestFloodfill (randomHash, dest->GetExcludedPeers ());
-			if (floodfill && !floodfills.count (floodfill)) // request floodfill only once
+			if (floodfill && !floodfills.count (floodfill.get ())) // request floodfill only once
 			{	
-				floodfills.insert (floodfill);
+				floodfills.insert (floodfill.get ());
 				if (throughTunnels)
 				{	
 					msgs.push_back (i2p::tunnel::TunnelMessageBlock 
@@ -776,29 +800,29 @@ namespace data
 		}	
 	}	
 
-	const RouterInfo * NetDb::GetRandomRouter () const
+	std::shared_ptr<const RouterInfo> NetDb::GetRandomRouter () const
 	{
 		return GetRandomRouter (
-			[](const RouterInfo * router)->bool 
+			[](std::shared_ptr<const RouterInfo> router)->bool 
 			{ 
 				return !router->IsHidden (); 
 			});
 	}	
 	
-	const RouterInfo * NetDb::GetRandomRouter (const RouterInfo * compatibleWith) const
+	std::shared_ptr<const RouterInfo> NetDb::GetRandomRouter (std::shared_ptr<const RouterInfo> compatibleWith) const
 	{
 		return GetRandomRouter (
-			[compatibleWith](const RouterInfo * router)->bool 
+			[compatibleWith](std::shared_ptr<const RouterInfo> router)->bool 
 			{ 
 				return !router->IsHidden () && router != compatibleWith && 
 					router->IsCompatible (*compatibleWith); 
 			});
 	}	
 
-	const RouterInfo * NetDb::GetHighBandwidthRandomRouter (const RouterInfo * compatibleWith) const
+	std::shared_ptr<const RouterInfo> NetDb::GetHighBandwidthRandomRouter (std::shared_ptr<const RouterInfo> compatibleWith) const
 	{
 		return GetRandomRouter (
-			[compatibleWith](const RouterInfo * router)->bool 
+			[compatibleWith](std::shared_ptr<const RouterInfo> router)->bool 
 			{ 
 				return !router->IsHidden () && router != compatibleWith &&
 					router->IsCompatible (*compatibleWith) && (router->GetCaps () & RouterInfo::eHighBandwidth); 
@@ -806,13 +830,14 @@ namespace data
 	}	
 	
 	template<typename Filter>
-	const RouterInfo * NetDb::GetRandomRouter (Filter filter) const
+	std::shared_ptr<const RouterInfo> NetDb::GetRandomRouter (Filter filter) const
 	{
 		CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
 		uint32_t ind = rnd.GenerateWord32 (0, m_RouterInfos.size () - 1);	
 		for (int j = 0; j < 2; j++)
 		{	
 			uint32_t i = 0;
+			std::unique_lock<std::mutex> l(m_RouterInfosMutex);
 			for (auto it: m_RouterInfos)
 			{	
 				if (i >= ind)
@@ -834,10 +859,10 @@ namespace data
 		if (msg) m_Queue.Put (msg);	
 	}	
 
-	const RouterInfo * NetDb::GetClosestFloodfill (const IdentHash& destination, 
+	std::shared_ptr<const RouterInfo> NetDb::GetClosestFloodfill (const IdentHash& destination, 
 		const std::set<IdentHash>& excluded) const
 	{
-		RouterInfo * r = nullptr;
+		std::shared_ptr<const RouterInfo> r;
 		XORMetric minMetric;
 		IdentHash destKey = CreateRoutingKey (destination);
 		minMetric.SetMax ();

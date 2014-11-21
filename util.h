@@ -3,6 +3,7 @@
 
 #include <map>
 #include <string>
+#include <boost/asio.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
@@ -24,6 +25,9 @@ namespace util
 
 	namespace filesystem
 	{
+		void SetAppName (const std::string& name);
+		std::string GetAppName ();
+
 		const boost::filesystem::path &GetDataDir();
 		std::string GetFullPath (const std::string& filename);	
 		boost::filesystem::path GetDefaultDataDir();
@@ -48,6 +52,11 @@ namespace util
 				std::string user_;
 				std::string pass_;
 		};
+	}
+
+	namespace net
+	{
+		int GetMTU (const boost::asio::ip::address& localAddress);
 	}
 }
 }

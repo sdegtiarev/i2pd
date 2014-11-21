@@ -34,7 +34,7 @@ namespace i2p
 	void RouterContext::NewRouterInfo ()
 	{
 		i2p::data::RouterInfo routerInfo;
-		routerInfo.SetRouterIdentity (GetIdentity ().GetStandardIdentity ());
+		routerInfo.SetRouterIdentity (GetIdentity ());
 		int port = i2p::util::config::GetArg("-port", 0);
 		if (!port)
 			port = m_Rnd.GenerateWord32 (9111, 30777); // I2P network ports range
@@ -72,15 +72,14 @@ namespace i2p
 			UpdateRouterInfo ();
 	}
 
-	void RouterContext::UpdateAddress (const char * host)
+	void RouterContext::UpdateAddress (const boost::asio::ip::address& host)
 	{
 		bool updated = false;
-		auto newAddress = boost::asio::ip::address::from_string (host);
 		for (auto& address : m_RouterInfo.GetAddresses ())
 		{
-			if (address.host != newAddress)
+			if (address.host != host && address.IsCompatible (host))
 			{	
-				address.host = newAddress;
+				address.host = host;
 				updated = true;
 			}	
 		}	
@@ -130,7 +129,52 @@ namespace i2p
 		// update
 		UpdateRouterInfo ();
 	}
-	
+
+	void RouterContext::SetSupportsV6 (bool supportsV6)
+	{
+		if (supportsV6)
+			m_RouterInfo.EnableV6 ();
+		else
+			m_RouterInfo.DisableV6 ();
+		UpdateRouterInfo ();
+	}	
+
+	void RouterContext::UpdateNTCPV6Address (const boost::asio::ip::address& host)
+	{
+		bool updated = false, found = false;	
+		int port = 0;
+		auto& addresses = m_RouterInfo.GetAddresses ();
+		for (auto& addr : addresses)
+		{
+			if (addr.host.is_v6 () && addr.transportStyle == i2p::data::RouterInfo::eTransportNTCP)
+			{
+				if (addr.host != host)
+				{
+					addr.host = host;
+					updated = true;
+				}
+				found = true;	
+			}	
+			else
+				port = addr.port;	
+		}	
+		if (!found)
+		{
+			// create new address
+			m_RouterInfo.AddNTCPAddress (host.to_string ().c_str (), port);
+			auto mtu = i2p::util::net::GetMTU (host);
+			if (mtu)
+			{	
+				LogPrint ("Our v6 MTU=", mtu);
+				if (mtu > 1472) mtu = 1472; 
+			}	
+			m_RouterInfo.AddSSUAddress (host.to_string ().c_str (), port, GetIdentHash (), mtu ? mtu : 1472); // TODO
+			updated = true;
+		}
+		if (updated)
+			UpdateRouterInfo ();
+	}
+		
 	bool RouterContext::Load ()
 	{
 		std::ifstream fk (i2p::util::filesystem::GetFullPath (ROUTER_KEYS).c_str (), std::ifstream::binary | std::ofstream::in);

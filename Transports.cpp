@@ -96,7 +96,7 @@ namespace transport
 	Transports transports;	
 	
 	Transports::Transports (): 
-		m_Thread (nullptr), m_Work (m_Service), m_NTCPAcceptor (nullptr), 
+		m_Thread (nullptr), m_Work (m_Service), m_NTCPAcceptor (nullptr), m_NTCPV6Acceptor (nullptr), 
 		m_SSUServer (nullptr), m_DHKeysPairSupplier (5) // 5 pre-generated keys
 	{		
 	}
@@ -115,7 +115,7 @@ namespace transport
 		auto addresses = context.GetRouterInfo ().GetAddresses ();
 		for (auto& address : addresses)
 		{
-			if (address.transportStyle == RouterInfo::eTransportNTCP)
+			if (address.transportStyle == RouterInfo::eTransportNTCP && address.host.is_v4 ())
 			{	
 				m_NTCPAcceptor = new boost::asio::ip::tcp::acceptor (m_Service,
 					boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), address.port));
@@ -123,9 +123,23 @@ namespace transport
 				LogPrint ("Start listening TCP port ", address.port);	
 				auto conn = new NTCPServerConnection (m_Service);
 				m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
-					conn, boost::asio::placeholders::error));
+					conn, boost::asio::placeholders::error));	
+				
+				if (context.SupportsV6 ())
+				{
+					m_NTCPV6Acceptor = new boost::asio::ip::tcp::acceptor (m_Service);
+					m_NTCPV6Acceptor->open (boost::asio::ip::tcp::v6());
+					m_NTCPV6Acceptor->set_option (boost::asio::ip::v6_only (true));
+					m_NTCPV6Acceptor->bind (boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v6(), address.port));
+					m_NTCPV6Acceptor->listen ();
+
+					LogPrint ("Start listening V6 TCP port ", address.port);	
+					auto conn = new NTCPServerConnection (m_Service);
+					m_NTCPV6Acceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAcceptV6,
+						this, conn, boost::asio::placeholders::error));
+				}	
 			}	
-			else if (address.transportStyle == RouterInfo::eTransportSSU)
+			else if (address.transportStyle == RouterInfo::eTransportSSU && address.host.is_v4 ())
 			{
 				if (!m_SSUServer)
 				{	
@@ -154,6 +168,8 @@ namespace transport
 		m_NTCPSessions.clear ();
 		delete m_NTCPAcceptor;
 		m_NTCPAcceptor = nullptr;
+		delete m_NTCPV6Acceptor;
+		m_NTCPV6Acceptor = nullptr;
 
 		m_DHKeysPairSupplier.Stop ();
 		m_IsRunning = false;
@@ -184,13 +200,13 @@ namespace transport
 	void Transports::AddNTCPSession (NTCPSession * session)
 	{
 		if (session)
-			m_NTCPSessions[session->GetRemoteRouterInfo ().GetIdentHash ()] = session;
+			m_NTCPSessions[session->GetRemoteIdentity ().GetIdentHash ()] = session;
 	}	
 
 	void Transports::RemoveNTCPSession (NTCPSession * session)
 	{
 		if (session)
-			m_NTCPSessions.erase (session->GetRemoteRouterInfo ().GetIdentHash ());
+			m_NTCPSessions.erase (session->GetRemoteIdentity ().GetIdentHash ());
 	}	
 		
 	void Transports::HandleAccept (NTCPServerConnection * conn, const boost::system::error_code& error)
@@ -207,6 +223,24 @@ namespace transport
 		{
     		conn = new NTCPServerConnection (m_Service);
 			m_NTCPAcceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAccept, this, 
+				conn, boost::asio::placeholders::error));
+		}	
+	}
+
+	void Transports::HandleAcceptV6 (NTCPServerConnection * conn, const boost::system::error_code& error)
+	{		
+		if (!error)
+		{
+			LogPrint ("Connected from ", conn->GetSocket ().remote_endpoint().address ().to_string ());
+			conn->ServerLogin ();
+		}
+		else
+			delete conn;
+
+		if (error != boost::asio::error::operation_aborted)
+		{
+    		conn = new NTCPServerConnection (m_Service);
+			m_NTCPV6Acceptor->async_accept(conn->GetSocket (), boost::bind (&Transports::HandleAcceptV6, this, 
 				conn, boost::asio::placeholders::error));
 		}	
 	}
@@ -243,20 +277,20 @@ namespace transport
 			session->SendI2NPMessage (msg);
 		else
 		{
-			RouterInfo * r = netdb.FindRouter (ident);
+			auto r = netdb.FindRouter (ident);
 			if (r)
 			{	
-				auto ssuSession = m_SSUServer ? m_SSUServer->FindSession (r) : nullptr;
+				auto ssuSession = m_SSUServer ? m_SSUServer->FindSession (r.get ()) : nullptr;
 				if (ssuSession)
 					ssuSession->SendI2NPMessage (msg);
 				else
 				{	
 					// existing session not found. create new 
 					// try NTCP first if message size < 16K
-					auto address = r->GetNTCPAddress ();
+					auto address = r->GetNTCPAddress (!context.SupportsV6 ()); 
 					if (address && !r->UsesIntroducer () && !r->IsUnreachable () && msg->GetLength () < NTCP_MAX_MESSAGE_SIZE)
 					{	
-						auto s = new NTCPClient (m_Service, address->host, address->port, *r);
+						auto s = new NTCPClient (m_Service, address->host, address->port, r);
 						AddNTCPSession (s);
 						s->SendI2NPMessage (msg);
 					}	
@@ -289,7 +323,7 @@ namespace transport
 	void Transports::HandleResendTimer (const boost::system::error_code& ecode, 
 		boost::asio::deadline_timer * timer, const i2p::data::IdentHash& ident, i2p::I2NPMessage * msg)
 	{
-		RouterInfo * r = netdb.FindRouter (ident);
+		auto r = netdb.FindRouter (ident);
 		if (r)
 		{
 			LogPrint ("Router found. Sending message");
@@ -322,7 +356,7 @@ namespace transport
 		
 	void Transports::DetectExternalIP ()
 	{
-		for (int i = 0; i < 5; i ++)
+		for (int i = 0; i < 5; i++)
 		{
 			auto router = i2p::data::netdb.GetRandomRouter ();
 			if (router && router->IsSSU () && m_SSUServer)

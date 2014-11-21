@@ -51,15 +51,6 @@ namespace transport
 		uint8_t signature[40];
 		uint8_t padding[8];
 	};
-
-	struct SignedData // used for signature in Phase3 and Phase4
-	{
-		uint8_t x[256];
-		uint8_t y[256];
-		uint8_t ident[32];
-		uint32_t tsA;
-		uint32_t tsB;
-	};	
 	
 #pragma pack()	
 
@@ -71,12 +62,11 @@ namespace transport
 	{
 		public:
 
-			NTCPSession (boost::asio::io_service& service, i2p::data::RouterInfo& in_RemoteRouterInfo);
-			virtual ~NTCPSession ();
+			NTCPSession (boost::asio::io_service& service, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter = nullptr);
+			~NTCPSession ();
 
 			boost::asio::ip::tcp::socket& GetSocket () { return m_Socket; };
 			bool IsEstablished () const { return m_IsEstablished; };
-			i2p::data::RouterInfo& GetRemoteRouterInfo () { return m_RemoteRouterInfo; };
 			
 			void ClientLogin ();
 			void ServerLogin ();
@@ -94,7 +84,7 @@ namespace transport
 			
 		private:
 
-			void CreateAESKey (uint8_t * pubKey, uint8_t * aesKey);
+			void CreateAESKey (uint8_t * pubKey, i2p::crypto::AESKey& key);
 				
 			// client
 			void SendPhase3 ();
@@ -133,8 +123,6 @@ namespace transport
 			i2p::crypto::CBCDecryption m_Decryption;
 			i2p::crypto::CBCEncryption m_Encryption;
 			CryptoPP::Adler32 m_Adler;
-			
-			i2p::data::RouterInfo& m_RemoteRouterInfo;
 
 			struct Establisher
 			{	
@@ -158,7 +146,7 @@ namespace transport
 	{
 		public:
 
-			NTCPClient (boost::asio::io_service& service, const boost::asio::ip::address& address, int port, i2p::data::RouterInfo& in_RouterInfo);
+			NTCPClient (boost::asio::io_service& service, const boost::asio::ip::address& address, int port, std::shared_ptr<const i2p::data::RouterInfo> in_RouterInfo);
 
 		private:
 
@@ -175,15 +163,11 @@ namespace transport
 		public:
 
 			NTCPServerConnection (boost::asio::io_service& service): 
-				NTCPSession (service, m_DummyRemoteRouterInfo) {};
+				NTCPSession (service) {};
 			
 		protected:
 
 			virtual void Connected ();
-			
-		private:	
-
-			i2p::data::RouterInfo m_DummyRemoteRouterInfo;
 	};	
 }	
 }	

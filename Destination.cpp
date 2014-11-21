@@ -107,6 +107,12 @@ namespace client
 	void ClientDestination::Stop ()
 	{	
 		m_StreamingDestination->Stop ();	
+		if (m_DatagramDestination)
+		{
+			auto d = m_DatagramDestination;
+			m_DatagramDestination = nullptr;
+			delete d;
+		}	
 		if (m_Pool)
 			i2p::tunnel::tunnels.StopTunnelPool (m_Pool);
 		m_IsRunning = false;
@@ -275,7 +281,7 @@ namespace client
 		return nullptr;	
 	}		
 
-	void ClientDestination::AcceptStreams (const std::function<void (i2p::stream::Stream *)>& acceptor)
+	void ClientDestination::AcceptStreams (const i2p::stream::StreamingDestination::Acceptor& acceptor)
 	{
 		if (m_StreamingDestination)
 			m_StreamingDestination->SetAcceptor (acceptor);
@@ -294,10 +300,11 @@ namespace client
 		return false;
 	}	
 
-	void ClientDestination::CreateDatagramDestination ()
+	i2p::datagram::DatagramDestination * ClientDestination::CreateDatagramDestination ()
 	{
 		if (!m_DatagramDestination)
 			m_DatagramDestination = new i2p::datagram::DatagramDestination (*this);
+		return m_DatagramDestination;	
 	}
 }
 }

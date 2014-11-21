@@ -12,13 +12,13 @@ CXXFLAGS= $(CFLAGS)
 all: obj i2p
 
 i2p: $(OBJECTS:obj/%=obj/%)
-	$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CXX) -o $@ $^ $(LDLIBS) $(LDFLAGS) $(LIBS)
 
 .SUFFIXES:
 .SUFFIXES:	.c .cc .C .cpp .o
 
 obj/%.o : %.cpp
-	$(CC) -o $@ $< -c $(CFLAGS) $(INCFLAGS) $(CPU_FLAGS)
+	$(CXX) -o $@ $< -c $(CXXFLAGS) $(NEEDED_CXXFLAGS) $(INCFLAGS) $(CPU_FLAGS)
 
 obj:
 	mkdir -p obj

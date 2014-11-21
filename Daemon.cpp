@@ -67,11 +67,13 @@ namespace i2p
 				i2p::context.UpdatePort (port);					
 			const char * host = i2p::util::config::GetCharArg("-host", "");
 			if (host && host[0])
-				i2p::context.UpdateAddress (host);	
+				i2p::context.UpdateAddress (boost::asio::ip::address::from_string (host));	
 
 			if (i2p::util::config::GetArg("-unreachable", 0))
 				i2p::context.SetUnreachable ();
 
+			i2p::context.SetSupportsV6 (i2p::util::config::GetArg("-v6", 0));
+			
 			LogPrint("CMD parameters:");
 			for (int i = 0; i < argc; ++i)
 				LogPrint(i, "  ", argv[i]);

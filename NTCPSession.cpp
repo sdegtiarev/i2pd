@@ -3,7 +3,6 @@
 #include "I2PEndian.h"
 #include <boost/bind.hpp>
 #include <cryptopp/dh.h>
-#include <cryptopp/dsa.h>
 #include "base64.h"
 #include "Log.h"
 #include "Timestamp.h"
@@ -11,6 +10,7 @@
 #include "I2NPProtocol.h"
 #include "RouterContext.h"
 #include "Transports.h"
+#include "NetDb.h"
 #include "NTCPSession.h"
 
 using namespace i2p::crypto;
@@ -19,9 +19,9 @@ namespace i2p
 {
 namespace transport
 {
-	NTCPSession::NTCPSession (boost::asio::io_service& service, i2p::data::RouterInfo& in_RemoteRouterInfo): 
-		m_Socket (service), m_TerminationTimer (service), m_IsEstablished (false),  
-		m_RemoteRouterInfo (in_RemoteRouterInfo), m_ReceiveBufferOffset (0), 
+	NTCPSession::NTCPSession (boost::asio::io_service& service, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter): 
+		TransportSession (in_RemoteRouter),	m_Socket (service), 
+		m_TerminationTimer (service), m_IsEstablished (false), m_ReceiveBufferOffset (0), 
 		m_NextMessage (nullptr), m_NumSentBytes (0), m_NumReceivedBytes (0)
 	{		
 		m_DHKeysPair = transports.GetNextDHKeysPair ();
@@ -38,7 +38,7 @@ namespace transport
 		m_DelayedMessages.clear ();	
 	}
 
-	void NTCPSession::CreateAESKey (uint8_t * pubKey, uint8_t * aesKey)
+	void NTCPSession::CreateAESKey (uint8_t * pubKey, i2p::crypto::AESKey& key)
 	{
 		CryptoPP::DH dh (elgp, elgg);
 		uint8_t sharedKey[256];
@@ -49,6 +49,7 @@ namespace transport
 			return;
 		};
 
+		uint8_t * aesKey = key;
 		if (sharedKey[0] & 0x80)
 		{
 			aesKey[0] = 0;
@@ -82,7 +83,8 @@ namespace transport
 		for (auto it :m_DelayedMessages)
 		{	
 			// try to send them again
-			transports.SendMessage (m_RemoteRouterInfo.GetIdentHash (), it);
+			if (m_RemoteRouter)
+				transports.SendMessage (m_RemoteRouter->GetIdentHash (), it);
 			numDelayed++;
 		}	
 		m_DelayedMessages.clear ();
@@ -124,7 +126,7 @@ namespace transport
 		const uint8_t * x = m_DHKeysPair->publicKey;
 		memcpy (m_Establisher->phase1.pubKey, x, 256);
 		CryptoPP::SHA256().CalculateDigest(m_Establisher->phase1.HXxorHI, x, 256);
-		const uint8_t * ident = m_RemoteRouterInfo.GetIdentHash ();
+		const uint8_t * ident = m_RemoteIdentity.GetIdentHash ();
 		for (int i = 0; i < 32; i++)
 			m_Establisher->phase1.HXxorHI[i] ^= ident[i];
 		
@@ -200,7 +202,7 @@ namespace transport
 		m_Establisher->phase2.encrypted.timestamp = tsB;
 		// TODO: fill filler
 
-		uint8_t aesKey[32];
+		i2p::crypto::AESKey aesKey;
 		CreateAESKey (m_Establisher->phase1.pubKey, aesKey);
 		m_Encryption.SetKey (aesKey);
 		m_Encryption.SetIV (y + 240);
@@ -237,7 +239,8 @@ namespace transport
 			LogPrint ("Phase 2 read error: ", ecode.message (), ". Wrong ident assumed");
 			if (ecode != boost::asio::error::operation_aborted)
 			{
-				GetRemoteRouterInfo ().SetUnreachable (true); // this RouterInfo is not valid
+				// this RI is not valid
+				i2p::data::netdb.SetUnreachable (GetRemoteIdentity ().GetIdentHash (), true);
 				transports.ReuseDHKeysPair (m_DHKeysPair);
 				m_DHKeysPair = nullptr;
 				Terminate ();
@@ -247,7 +250,7 @@ namespace transport
 		{	
 			LogPrint ("Phase 2 received: ", bytes_transferred);
 		
-			uint8_t aesKey[32];
+			i2p::crypto::AESKey aesKey;
 			CreateAESKey (m_Establisher->phase2.pubKey, aesKey);
 			m_Decryption.SetKey (aesKey);
 			m_Decryption.SetIV (m_Establisher->phase2.pubKey + 240);
@@ -280,12 +283,12 @@ namespace transport
 		m_Establisher->phase3.timestamp = tsA;
 		
 		SignedData s;
-		memcpy (s.x, m_Establisher->phase1.pubKey, 256);
-		memcpy (s.y, m_Establisher->phase2.pubKey, 256);
-		memcpy (s.ident, m_RemoteRouterInfo.GetIdentHash (), 32);
-		s.tsA = tsA;
-		s.tsB = m_Establisher->phase2.encrypted.timestamp;
-		i2p::context.Sign ((uint8_t *)&s, sizeof (s), m_Establisher->phase3.signature);
+		s.Insert (m_Establisher->phase1.pubKey, 256); // x
+		s.Insert (m_Establisher->phase2.pubKey, 256); // y
+		s.Insert (m_RemoteIdentity.GetIdentHash (), 32); // ident
+ 		s.Insert (tsA);	// tsA
+		s.Insert (m_Establisher->phase2.encrypted.timestamp); // tsB
+		s.Sign (i2p::context.GetPrivateKeys (), m_Establisher->phase3.signature);	
 
 		m_Encryption.Encrypt((uint8_t *)&m_Establisher->phase3, sizeof(NTCPPhase3), (uint8_t *)&m_Establisher->phase3);
 		        
@@ -322,19 +325,15 @@ namespace transport
 		{	
 			LogPrint ("Phase 3 received: ", bytes_transferred);
 			m_Decryption.Decrypt ((uint8_t *)&m_Establisher->phase3, sizeof(NTCPPhase3), (uint8_t *)&m_Establisher->phase3);
-			m_RemoteRouterInfo.SetRouterIdentity (m_Establisher->phase3.ident);
+			m_RemoteIdentity = m_Establisher->phase3.ident;
 
 			SignedData s;
-			memcpy (s.x, m_Establisher->phase1.pubKey, 256);
-			memcpy (s.y, m_Establisher->phase2.pubKey, 256);
-			memcpy (s.ident, i2p::context.GetRouterInfo ().GetIdentHash (), 32);
-			s.tsA = m_Establisher->phase3.timestamp;
-			s.tsB = tsB;
-			
-			CryptoPP::DSA::PublicKey pubKey;
-			pubKey.Initialize (dsap, dsaq, dsag, CryptoPP::Integer (m_RemoteRouterInfo.GetRouterIdentity ().signingKey, 128));
-			CryptoPP::DSA::Verifier verifier (pubKey);
-			if (!verifier.VerifyMessage ((uint8_t *)&s, sizeof(s), m_Establisher->phase3.signature, 40))
+			s.Insert (m_Establisher->phase1.pubKey, 256); // x
+			s.Insert (m_Establisher->phase2.pubKey, 256); // y
+			s.Insert (i2p::context.GetRouterInfo ().GetIdentHash (), 32); // ident
+			s.Insert (m_Establisher->phase3.timestamp); // tsA
+			s.Insert (tsB); // tsB			
+			if (!s.Verify (m_RemoteIdentity, m_Establisher->phase3.signature))
 			{	
 				LogPrint ("signature verification failed");
 				Terminate ();
@@ -348,12 +347,12 @@ namespace transport
 	void NTCPSession::SendPhase4 (uint32_t tsB)
 	{
 		SignedData s;
-		memcpy (s.x, m_Establisher->phase1.pubKey, 256);
-		memcpy (s.y, m_Establisher->phase2.pubKey, 256);
-		memcpy (s.ident, m_RemoteRouterInfo.GetIdentHash (), 32);
-		s.tsA = m_Establisher->phase3.timestamp;
-		s.tsB = tsB;
-		i2p::context.Sign ((uint8_t *)&s, sizeof (s), m_Establisher->phase4.signature);
+		s.Insert (m_Establisher->phase1.pubKey, 256); // x
+		s.Insert (m_Establisher->phase2.pubKey, 256); // y
+		s.Insert (m_RemoteIdentity.GetIdentHash (), 32); // ident
+		s.Insert (m_Establisher->phase3.timestamp); // tsA
+		s.Insert (tsB); // tsB
+		s.Sign (i2p::context.GetPrivateKeys (), m_Establisher->phase4.signature);
 		m_Encryption.Encrypt ((uint8_t *)&m_Establisher->phase4, sizeof(NTCPPhase4), (uint8_t *)&m_Establisher->phase4);
 
 		boost::asio::async_write (m_Socket, boost::asio::buffer (&m_Establisher->phase4, sizeof (NTCPPhase4)), boost::asio::transfer_all (),
@@ -385,7 +384,8 @@ namespace transport
 			LogPrint ("Phase 4 read error: ", ecode.message ());
 			if (ecode != boost::asio::error::operation_aborted)
 			{
-				GetRemoteRouterInfo ().SetUnreachable (true); // this router doesn't like us
+				 // this router doesn't like us	
+				i2p::data::netdb.SetUnreachable (GetRemoteIdentity ().GetIdentHash (), true);
 				Terminate ();
 			}	
 		}
@@ -396,16 +396,13 @@ namespace transport
 
 			// verify signature
 			SignedData s;
-			memcpy (s.x, m_Establisher->phase1.pubKey, 256);
-			memcpy (s.y, m_Establisher->phase2.pubKey, 256);
-			memcpy (s.ident, i2p::context.GetRouterInfo ().GetIdentHash (), 32);
-			s.tsA = tsA;
-			s.tsB = m_Establisher->phase2.encrypted.timestamp;
+			s.Insert (m_Establisher->phase1.pubKey, 256); // x
+			s.Insert (m_Establisher->phase2.pubKey, 256); // y
+			s.Insert (i2p::context.GetRouterInfo ().GetIdentHash (), 32); // ident
+			s.Insert (tsA); // tsA
+			s.Insert (m_Establisher->phase2.encrypted.timestamp); // tsB
 
-			CryptoPP::DSA::PublicKey pubKey;
-			pubKey.Initialize (dsap, dsaq, dsag, CryptoPP::Integer (m_RemoteRouterInfo.GetRouterIdentity ().signingKey, 128));
-			CryptoPP::DSA::Verifier verifier (pubKey);
-			if (!verifier.VerifyMessage ((uint8_t *)&s, sizeof(s), m_Establisher->phase4.signature, 40))
+			if (!s.Verify (m_RemoteIdentity, m_Establisher->phase4.signature))
 			{	
 				LogPrint ("signature verification failed");
 				Terminate ();
@@ -431,7 +428,7 @@ namespace transport
 		if (ecode)
         {
 			LogPrint ("Read error: ", ecode.message ());
-			if (ecode != boost::asio::error::operation_aborted)
+			//if (ecode != boost::asio::error::operation_aborted)
 				Terminate ();
 		}
 		else
@@ -593,15 +590,15 @@ namespace transport
 		if (ecode != boost::asio::error::operation_aborted)
 		{	
 			LogPrint ("No activity fo ", NTCP_TERMINATION_TIMEOUT, " seconds");
-			Terminate ();
+			//Terminate ();
+			m_Socket.close ();// invoke Terminate () from HandleReceive 
 		}	
 	}	
 		
 		
 	NTCPClient::NTCPClient (boost::asio::io_service& service, const boost::asio::ip::address& address, 
-		int port, i2p::data::RouterInfo& in_RouterInfo): 
-		NTCPSession (service, in_RouterInfo),
-		m_Endpoint (address, port)	
+		int port, std::shared_ptr<const i2p::data::RouterInfo> in_RouterInfo): 
+		NTCPSession (service, in_RouterInfo), m_Endpoint (address, port)	
 	{
 		Connect ();
 	}
@@ -620,13 +617,15 @@ namespace transport
 			LogPrint ("Connect error: ", ecode.message ());
 			if (ecode != boost::asio::error::operation_aborted)
 			{
-				GetRemoteRouterInfo ().SetUnreachable (true);
+				i2p::data::netdb.SetUnreachable (GetRemoteIdentity ().GetIdentHash (), true);
 				Terminate ();
 			}
 		}
 		else
 		{
 			LogPrint ("Connected");
+			if (GetSocket ().local_endpoint ().protocol () == boost::asio::ip::tcp::v6()) // ipv6
+				context.UpdateNTCPV6Address (GetSocket ().local_endpoint ().address ());
 			ClientLogin ();
 		}	
 	}	
@@ -634,11 +633,8 @@ namespace transport
 	void NTCPServerConnection::Connected ()
 	{
 		LogPrint ("NTCP server session connected");
-		SetIsEstablished (true);
 		transports.AddNTCPSession (this);
-
-		SendTimeSyncMessage ();
-		SendI2NPMessage (CreateDatabaseStoreMsg ()); // we tell immediately who we are		
+		NTCPSession::Connected ();
 	}	
 }	
 }	

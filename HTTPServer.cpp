@@ -644,10 +644,16 @@ namespace util
 			switch (address.transportStyle)
 			{
 				case i2p::data::RouterInfo::eTransportNTCP:
-					s << "NTCP&nbsp;&nbsp;";
+					if (address.host.is_v6 ())
+						s << "NTCP6&nbsp;&nbsp;";
+					else
+						s << "NTCP&nbsp;&nbsp;";
 				break;
 				case i2p::data::RouterInfo::eTransportSSU:
-					s << "SSU&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;";
+					if (address.host.is_v6 ())
+						s << "SSU6&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;";
+					else
+						s << "SSU&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;";
 				break;
 				default:
 					s << "Unknown&nbsp;&nbsp;";
@@ -701,12 +707,12 @@ namespace util
 		s << "NTCP<br>";
 		for (auto it: i2p::transport::transports.GetNTCPSessions ())
 		{
-			// RouterInfo of incoming connection doesn't have address
-			bool outgoing = it.second->GetRemoteRouterInfo ().GetNTCPAddress ();
-			if (it.second->IsEstablished ())
+			if (it.second && it.second->IsEstablished ())
 			{
+				// incoming connection doesn't have remote RI
+				auto outgoing = it.second->GetRemoteRouter ();
 				if (outgoing) s << "-->";
-				s << it.second->GetRemoteRouterInfo ().GetIdentHashAbbreviation () <<  ": "
+				s << it.second->GetRemoteIdentity ().GetIdentHash ().ToBase64 ().substr (0, 4) <<  ": "
 					<< it.second->GetSocket ().remote_endpoint().address ().to_string ();
 				if (!outgoing) s << "-->";
 				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
@@ -721,7 +727,7 @@ namespace util
 			for (auto it: ssuServer->GetSessions ())
 			{
 				// incoming connections don't have remote router
-				bool outgoing = it.second->GetRemoteRouter ();
+				auto outgoing = it.second->GetRemoteRouter ();
 				auto endpoint = it.second->GetRemoteEndpoint ();
 				if (outgoing) s << "-->";
 				s << endpoint.address ().to_string () << ":" << endpoint.port ();
@@ -845,7 +851,7 @@ namespace util
 	void HTTPConnection::SendToAddress (const std::string& address, int port, const char * buf, size_t len)
 	{	
 		i2p::data::IdentHash destination;
-		if (!i2p::data::netdb.GetAddressBook ().GetIdentHash (address, destination))
+		if (!i2p::client::context.GetAddressBook ().GetIdentHash (address, destination))
 		{
 			LogPrint ("Unknown address ", address);
 			SendReply ("<html>" + itoopieImage + "<br>Unknown address " + address + "</html>", 404);

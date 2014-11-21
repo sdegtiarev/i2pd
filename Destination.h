@@ -42,13 +42,13 @@ namespace client
 			// streaming
 			i2p::stream::StreamingDestination * GetStreamingDestination () const { return m_StreamingDestination; };
 			i2p::stream::Stream * CreateStream (const i2p::data::LeaseSet& remote, int port = 0);
-			void AcceptStreams (const std::function<void (i2p::stream::Stream *)>& acceptor);
+			void AcceptStreams (const i2p::stream::StreamingDestination::Acceptor& acceptor);
 			void StopAcceptingStreams ();
 			bool IsAcceptingStreams () const;
 
 			// datagram
 			i2p::datagram::DatagramDestination * GetDatagramDestination () const { return m_DatagramDestination; };
-			void CreateDatagramDestination ();
+			i2p::datagram::DatagramDestination * CreateDatagramDestination ();
 
 			// implements LocalDestination
 			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };

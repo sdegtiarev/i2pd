@@ -466,7 +466,7 @@ namespace tunnel
 			if (!inboundTunnel) return;
 			LogPrint ("Creating one hop outbound tunnel...");
 			CreateTunnel<OutboundTunnel> (
-			  	new TunnelConfig (std::vector<const i2p::data::RouterInfo *> 
+			  	new TunnelConfig (std::vector<std::shared_ptr<const i2p::data::RouterInfo> > 
 				    { 
 						i2p::data::netdb.GetRandomRouter ()
 					},		
@@ -519,7 +519,7 @@ namespace tunnel
 			// trying to create one more inbound tunnel			
 			LogPrint ("Creating one hop inbound tunnel...");
 			CreateTunnel<InboundTunnel> (
-				new TunnelConfig (std::vector<const i2p::data::RouterInfo *>
+				new TunnelConfig (std::vector<std::shared_ptr<const i2p::data::RouterInfo> >
 				    {              
 						i2p::data::netdb.GetRandomRouter ()
 					}));
@@ -609,9 +609,9 @@ namespace tunnel
 	void Tunnels::CreateZeroHopsInboundTunnel ()
 	{
 		CreateTunnel<InboundTunnel> (
-			new TunnelConfig (std::vector<const i2p::data::RouterInfo *>
+			new TunnelConfig (std::vector<std::shared_ptr<const i2p::data::RouterInfo> >
 			    { 
-					&i2p::context.GetRouterInfo ()
+					i2p::context.GetSharedRouterInfo ()
 				}));
 	}	
 }
