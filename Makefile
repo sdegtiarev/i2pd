@@ -58,7 +58,6 @@ ifneq ($(USE_STATIC),yes)
 endif
 
 clean:
-<<<<<<< HEAD
 	rm -fr obj i2p
 	
 io: io.cc
@@ -73,19 +72,3 @@ ios: ios.cc
 
 ver:
 	@echo $(CXXVER) flags: $(CFLAGS)
-=======
-	rm -rf obj
-	$(RM) $(I2PD) $(SHLIB)
-
-LATEST_TAG=$(shell git describe --tags --abbrev=0 master)
-dist:
-	git archive --format=tar.gz -9 --worktree-attributes \
-	    --prefix=i2pd_$(LATEST_TAG)/ $(LATEST_TAG) -o i2pd_$(LATEST_TAG).tar.gz
-
-.PHONY: all
-.PHONY: clean
-.PHONY: deps
-.PHONY: dist
-.PHONY: api
-.PHONY: mk_build_dir
->>>>>>> c61cd350eebf573d48e31e475d6484854e7111e1
