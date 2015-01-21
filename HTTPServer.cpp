@@ -485,17 +485,17 @@ namespace util
 		{
 			switch (status)
 			{
-				case 105: buffers.push_back(boost::asio::buffer("HTTP/1.0 105 Name Not Resolved\r\n")); break;
-				case 200: buffers.push_back(boost::asio::buffer("HTTP/1.0 200 OK\r\n")); break;
-				case 400: buffers.push_back(boost::asio::buffer("HTTP/1.0 400 Bad Request\r\n")); break;
-				case 404: buffers.push_back(boost::asio::buffer("HTTP/1.0 404 Not Found\r\n")); break;
-				case 408: buffers.push_back(boost::asio::buffer("HTTP/1.0 408 Request Timeout\r\n")); break;
-				case 500: buffers.push_back(boost::asio::buffer("HTTP/1.0 500 Internal Server Error\r\n")); break;
-				case 502: buffers.push_back(boost::asio::buffer("HTTP/1.0 502 Bad Gateway\r\n")); break;
-				case 503: buffers.push_back(boost::asio::buffer("HTTP/1.0 503 Not Implemented\r\n")); break;
-				case 504: buffers.push_back(boost::asio::buffer("HTTP/1.0 504 Gateway Timeout\r\n")); break;
+				case 105: buffers.push_back(boost::asio::buffer("HTTP/1.1 105 Name Not Resolved\r\n")); break;
+				case 200: buffers.push_back(boost::asio::buffer("HTTP/1.1 200 OK\r\n")); break;
+				case 400: buffers.push_back(boost::asio::buffer("HTTP/1.1 400 Bad Request\r\n")); break;
+				case 404: buffers.push_back(boost::asio::buffer("HTTP/1.1 404 Not Found\r\n")); break;
+				case 408: buffers.push_back(boost::asio::buffer("HTTP/1.1 408 Request Timeout\r\n")); break;
+				case 500: buffers.push_back(boost::asio::buffer("HTTP/1.1 500 Internal Server Error\r\n")); break;
+				case 502: buffers.push_back(boost::asio::buffer("HTTP/1.1 502 Bad Gateway\r\n")); break;
+				case 503: buffers.push_back(boost::asio::buffer("HTTP/1.1 503 Not Implemented\r\n")); break;
+				case 504: buffers.push_back(boost::asio::buffer("HTTP/1.1 504 Gateway Timeout\r\n")); break;
 				default:
-					buffers.push_back(boost::asio::buffer("HTTP/1.0 200 OK\r\n"));
+					buffers.push_back(boost::asio::buffer("HTTP/1.1 200 OK\r\n"));
 			}
 
 			for (std::size_t i = 0; i < headers.size(); ++i)
@@ -514,14 +514,16 @@ namespace util
 
 	void HTTPConnection::Terminate ()
 	{
-		if (m_Stream)
-		{
-			m_Stream->Close ();
-			i2p::stream::DeleteStream (m_Stream);
-			m_Stream = nullptr;
-		}
+		if (!m_Stream) return;
 		m_Socket->close ();
-		//delete this;
+		m_Stream->Close ();
+			
+		m_Socket->get_io_service ().post ([=](void)
+			{
+				m_Stream.reset ();
+				m_Stream = nullptr;
+				// delete this
+			});
 	}
 
 	void HTTPConnection::Receive ()
@@ -602,7 +604,10 @@ namespace util
 	void HTTPConnection::HandleWriteReply (const boost::system::error_code& ecode)
 	{
 		if (ecode != boost::asio::error::operation_aborted)
+		{
+			m_Socket->close ();
 			Terminate ();
+		}	
 	}
 
 	void HTTPConnection::HandleWrite (const boost::system::error_code& ecode)
@@ -704,22 +709,26 @@ namespace util
 
 	void HTTPConnection::ShowTransports (std::stringstream& s)
 	{
-		s << "NTCP<br>";
-		for (auto it: i2p::transport::transports.GetNTCPSessions ())
-		{
-			if (it.second && it.second->IsEstablished ())
+		auto ntcpServer = i2p::transport::transports.GetNTCPServer (); 
+		if (ntcpServer)
+		{	
+			s << "NTCP<br>";
+			for (auto it: ntcpServer->GetNTCPSessions ())
 			{
-				// incoming connection doesn't have remote RI
-				auto outgoing = it.second->GetRemoteRouter ();
-				if (outgoing) s << "-->";
-				s << it.second->GetRemoteIdentity ().GetIdentHash ().ToBase64 ().substr (0, 4) <<  ": "
-					<< it.second->GetSocket ().remote_endpoint().address ().to_string ();
-				if (!outgoing) s << "-->";
-				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
-				s << "<br>";
+				if (it.second && it.second->IsEstablished ())
+				{
+					// incoming connection doesn't have remote RI
+					auto outgoing = it.second->GetRemoteRouter ();
+					if (outgoing) s << "-->";
+					s << it.second->GetRemoteIdentity ().GetIdentHash ().ToBase64 ().substr (0, 4) <<  ": "
+						<< it.second->GetSocket ().remote_endpoint().address ().to_string ();
+					if (!outgoing) s << "-->";
+					s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
+					s << "<br>";
+				}
+				s << std::endl;
 			}
-			s << std::endl;
-		}
+		}	
 		auto ssuServer = i2p::transport::transports.GetSSUServer ();
 		if (ssuServer)
 		{
@@ -744,8 +753,6 @@ namespace util
 		for (auto it: i2p::tunnel::tunnels.GetOutboundTunnels ())
 		{
 			it->GetTunnelConfig ()->Print (s);
-			if (it->GetTunnelPool () && !it->GetTunnelPool ()->IsExploratory ())
-				s << " " << "Pool";
 			auto state = it->GetState ();
 			if (state == i2p::tunnel::eTunnelStateFailed)
 				s << " " << "Failed";
@@ -758,8 +765,6 @@ namespace util
 		for (auto it: i2p::tunnel::tunnels.GetInboundTunnels ())
 		{
 			it.second->GetTunnelConfig ()->Print (s);
-			if (it.second->GetTunnelPool () && !it.second->GetTunnelPool ()->IsExploratory ())
-				s << " " << "Pool";
 			auto state = it.second->GetState ();
 			if (state == i2p::tunnel::eTunnelStateFailed)
 				s << " " << "Failed";
@@ -791,7 +796,7 @@ namespace util
 			std::string b32 = it.first.ToBase32 (); 
 			s << "<a href=/?" << HTTP_COMMAND_LOCAL_DESTINATION;
 			s << "&" << HTTP_PARAM_BASE32_ADDRESS << "=" << b32 << ">"; 
-			s << b32 << ".b32.i2p</a><br>" << std::endl;
+			s << i2p::client::context.GetAddressBook ().ToAddress(it.second->GetIdentHash()) << "</a><br>" << std::endl;
 		}
 	}	
 
@@ -810,18 +815,28 @@ namespace util
 				for (auto it: pool->GetOutboundTunnels ())
 				{
 					it->GetTunnelConfig ()->Print (s);
+					auto state = it->GetState ();
+					if (state == i2p::tunnel::eTunnelStateFailed)
+						s << " " << "Failed";
+					else if (state == i2p::tunnel::eTunnelStateExpiring)
+						s << " " << "Exp";
 					s << "<br>" << std::endl;
 				}
 				for (auto it: pool->GetInboundTunnels ())
 				{
 					it->GetTunnelConfig ()->Print (s);
+					auto state = it->GetState ();
+					if (state == i2p::tunnel::eTunnelStateFailed)
+						s << " " << "Failed";
+					else if (state == i2p::tunnel::eTunnelStateExpiring)
+						s << " " << "Exp";
 					s << "<br>" << std::endl;
 				}
 			}	
 			s << "<br><b>Streams:</b><br>";
 			for (auto it: dest->GetStreamingDestination ()->GetStreams ())
 			{	
-				s << it.first << "->" << it.second->GetRemoteIdentity ().GetIdentHash ().ToBase32 () << ".b32.i2p ";
+				s << it.first << "->" << i2p::client::context.GetAddressBook ().ToAddress(it.second->GetRemoteIdentity ()) << " ";
 				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
 				s << " [out:" << it.second->GetSendQueueSize () << "][in:" << it.second->GetReceiveQueueSize () << "]";
 				s << "<br>"<< std::endl; 
@@ -863,10 +878,12 @@ namespace util
 			SendToDestination (leaseSet, port, buf, len);
 		else
 		{
-			i2p::data::netdb.RequestDestination (destination, true, i2p::client::context.GetSharedLocalDestination ()->GetTunnelPool ());
+			memcpy (m_Buffer, buf, len);
+			m_BufferLen = len;
+			i2p::client::context.GetSharedLocalDestination ()->RequestDestination (destination);
 			m_Timer.expires_from_now (boost::posix_time::seconds(HTTP_DESTINATION_REQUEST_TIMEOUT));
 			m_Timer.async_wait (boost::bind (&HTTPConnection::HandleDestinationRequestTimeout,
-				this, boost::asio::placeholders::error, destination, port, buf, len));
+				this, boost::asio::placeholders::error, destination, port, m_Buffer, m_BufferLen));
 		}
 	}
 	

@@ -1,3 +1,4 @@
+#include <string.h>
 #include "I2PEndian.h"
 #include <thread>
 #include <algorithm>
@@ -33,7 +34,7 @@ namespace tunnel
 		int numRecords = numHops <= STANDARD_NUM_RECORDS ? STANDARD_NUM_RECORDS : numHops; 
 		I2NPMessage * msg = NewI2NPMessage ();
 		*msg->GetPayload () = numRecords;
-		msg->len += numRecords*sizeof (I2NPBuildRequestRecordElGamalEncrypted) + 1;		
+		msg->len += numRecords*TUNNEL_BUILD_RECORD_SIZE + 1;		
 
 		// shuffle records
 		std::vector<int> recordIndicies;
@@ -41,22 +42,14 @@ namespace tunnel
 		std::random_shuffle (recordIndicies.begin(), recordIndicies.end());
 
 		// create real records
-		I2NPBuildRequestRecordElGamalEncrypted * records = (I2NPBuildRequestRecordElGamalEncrypted *)(msg->GetPayload () + 1); 
+		uint8_t * records = msg->GetPayload () + 1; 
 		TunnelHopConfig * hop = m_Config->GetFirstHop ();
 		int i = 0;
 		while (hop)
 		{
 			int idx = recordIndicies[i];
-			EncryptBuildRequestRecord (*hop->router,
-				CreateBuildRequestRecord (hop->router->GetIdentHash (), 
-				    hop->tunnelID,
-					hop->nextRouter->GetIdentHash (), 
-					hop->nextTunnelID,
-					hop->layerKey, hop->ivKey,                  
-					hop->replyKey, hop->replyIV,
-					hop->next ? rnd.GenerateWord32 () : replyMsgID, // we set replyMsgID for last hop only
-				    hop->isGateway, hop->isEndpoint), 
-		    	records[idx]);
+			hop->CreateBuildRequestRecord (records + idx*TUNNEL_BUILD_RECORD_SIZE, 
+				hop->next ? rnd.GenerateWord32 () : replyMsgID); // we set replyMsgID for last hop only 
 			hop->recordIndex = idx; 
 			i++;
 			hop = hop->next;
@@ -65,7 +58,7 @@ namespace tunnel
 		for (int i = numHops; i < numRecords; i++)
 		{
 			int idx = recordIndicies[i];
-			rnd.GenerateBlock ((uint8_t *)(records + idx), sizeof (records[idx])); 
+			rnd.GenerateBlock (records + idx*TUNNEL_BUILD_RECORD_SIZE, TUNNEL_BUILD_RECORD_SIZE); 
 		}	
 
 		// decrypt real records
@@ -79,9 +72,8 @@ namespace tunnel
 			while (hop1)
 			{	
 				decryption.SetIV (hop->replyIV);
-				decryption.Decrypt((uint8_t *)&records[hop1->recordIndex], 
-					sizeof (I2NPBuildRequestRecordElGamalEncrypted), 
-				    (uint8_t *)&records[hop1->recordIndex]);
+				uint8_t * record = records + hop1->recordIndex*TUNNEL_BUILD_RECORD_SIZE;
+				decryption.Decrypt(record, TUNNEL_BUILD_RECORD_SIZE, record);
 				hop1 = hop1->next;
 			}	
 			hop = hop->prev;
@@ -111,9 +103,9 @@ namespace tunnel
 				auto idx = hop1->recordIndex;
 				if (idx >= 0 && idx < msg[0])
 				{	
-					uint8_t * record = msg + 1 + idx*sizeof (I2NPBuildResponseRecord);
+					uint8_t * record = msg + 1 + idx*TUNNEL_BUILD_RECORD_SIZE;
 					decryption.SetIV (hop->replyIV);
-					decryption.Decrypt(record, sizeof (I2NPBuildResponseRecord), record);
+					decryption.Decrypt(record, TUNNEL_BUILD_RECORD_SIZE, record);
 				}	
 				else
 					LogPrint ("Tunnel hop index ", idx, " is out of range");
@@ -126,9 +118,10 @@ namespace tunnel
 		hop = m_Config->GetFirstHop ();
 		while (hop)
 		{			
-			I2NPBuildResponseRecord * record = (I2NPBuildResponseRecord *)(msg + 1 + hop->recordIndex*sizeof (I2NPBuildResponseRecord));
-			LogPrint ("Ret code=", (int)record->ret);
-			if (record->ret) 
+			const uint8_t * record = msg + 1 + hop->recordIndex*TUNNEL_BUILD_RECORD_SIZE;
+			uint8_t ret = record[BUILD_RESPONSE_RECORD_RET_OFFSET];
+			LogPrint ("Ret code=", (int)ret);
+			if (ret) 
 				// if any of participants declined the tunnel is not established
 				established = false; 
 			hop = hop->next;
@@ -198,7 +191,7 @@ namespace tunnel
 	
 	Tunnels tunnels;
 	
-	Tunnels::Tunnels (): m_IsRunning (false), m_Thread (nullptr), m_ExploratoryPool (nullptr)
+	Tunnels::Tunnels (): m_IsRunning (false), m_Thread (nullptr)
 	{
 	}
 	
@@ -216,13 +209,11 @@ namespace tunnel
 			delete it.second;
 		m_TransitTunnels.clear ();
 
-		/*for (auto& it : m_PendingTunnels)
+		ManagePendingTunnels ();
+		for (auto& it : m_PendingTunnels)
 			delete it.second;
-		m_PendingTunnels.clear ();*/
+		m_PendingTunnels.clear ();
 
-		for (auto& it: m_Pools)
-			delete it.second;
-		m_Pools.clear ();
 	}	
 	
 	InboundTunnel * Tunnels::GetInboundTunnel (uint32_t tunnelID)
@@ -287,28 +278,27 @@ namespace tunnel
 		return tunnel;
 	}	
 
-	TunnelPool * Tunnels::CreateTunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops)
+	std::shared_ptr<TunnelPool> Tunnels::CreateTunnelPool (i2p::garlic::GarlicDestination * localDestination, int numInboundHops, int numOutboundHops)
 	{
-		auto pool = new TunnelPool (localDestination, numHops);
+		auto pool = std::make_shared<TunnelPool> (localDestination, numInboundHops, numOutboundHops);
 		std::unique_lock<std::mutex> l(m_PoolsMutex);
-		m_Pools[pool->GetIdentHash ()] = pool;
+		m_Pools.push_back (pool);
 		return pool;
 	}	
 
-	void Tunnels::DeleteTunnelPool (TunnelPool * pool)
+	void Tunnels::DeleteTunnelPool (std::shared_ptr<TunnelPool> pool)
 	{
 		if (pool)
 		{	
 			StopTunnelPool (pool);
-			m_Pools.erase (pool->GetLocalDestination ().GetIdentHash ());
-			for (auto it: m_PendingTunnels)
-				if (it.second->GetTunnelPool () == pool)
-					it.second->SetTunnelPool (nullptr);
-			delete pool;
+			{
+				std::unique_lock<std::mutex> l(m_PoolsMutex);
+				m_Pools.remove (pool);
+			}	
 		}	
 	}	
 
-	void Tunnels::StopTunnelPool (TunnelPool * pool)
+	void Tunnels::StopTunnelPool (std::shared_ptr<TunnelPool> pool)
 	{
 		if (pool)
 		{
@@ -353,7 +343,7 @@ namespace tunnel
 				I2NPMessage * msg = m_Queue.GetNextWithTimeout (1000); // 1 sec
 				while (msg)
 				{
-					uint32_t  tunnelID = be32toh (*(uint32_t *)msg->GetPayload ()); 
+					uint32_t  tunnelID = bufbe32toh (msg->GetPayload ()); 
 					InboundTunnel * tunnel = GetInboundTunnel (tunnelID);
 					if (tunnel)
 						tunnel->HandleTunnelDataMsg (msg);
@@ -439,7 +429,6 @@ namespace tunnel
 				{
 					LogPrint ("Tunnel ", tunnel->GetTunnelID (), " expired");
 					{
-						std::unique_lock<std::mutex> l(m_PoolsMutex);
 						auto pool = tunnel->GetTunnelPool ();
 						if (pool)
 							pool->TunnelExpired (tunnel);
@@ -485,7 +474,6 @@ namespace tunnel
 				{
 					LogPrint ("Tunnel ", tunnel->GetTunnelID (), " expired");
 					{
-						std::unique_lock<std::mutex> l(m_PoolsMutex);
 						auto pool = tunnel->GetTunnelPool ();
 						if (pool)
 							pool->TunnelExpired (tunnel);
@@ -510,7 +498,7 @@ namespace tunnel
 			LogPrint ("Creating zero hops inbound tunnel...");
 			CreateZeroHopsInboundTunnel ();
 			if (!m_ExploratoryPool)
-				m_ExploratoryPool = CreateTunnelPool (i2p::context, 2); // 2-hop exploratory
+				m_ExploratoryPool = CreateTunnelPool (&i2p::context, 2, 2); // 2-hop exploratory
 			return;
 		}
 		
@@ -533,8 +521,8 @@ namespace tunnel
 		{
 			if (ts > it->second->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT)
 			{
-				LogPrint ("Transit tunnel ", it->second->GetTunnelID (), " expired");
 				auto tmp = it->second;
+				LogPrint ("Transit tunnel ", tmp->GetTunnelID (), " expired");
 				{
 					std::unique_lock<std::mutex> l(m_TransitTunnelsMutex);
 					it = m_TransitTunnels.erase (it);
@@ -551,8 +539,8 @@ namespace tunnel
 		std::unique_lock<std::mutex> l(m_PoolsMutex);
 		for (auto it: m_Pools)
 		{	
-			TunnelPool * pool = it.second;
-			if (pool->IsActive ())
+			auto pool = it;
+			if (pool && pool->IsActive ())
 			{	
 				pool->CreateTunnels ();
 				pool->TestTunnels ();
@@ -613,6 +601,19 @@ namespace tunnel
 			    { 
 					i2p::context.GetSharedRouterInfo ()
 				}));
+	}	
+
+	int Tunnels::GetTransitTunnelsExpirationTimeout ()
+	{
+		int timeout = 0;
+		uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
+		std::unique_lock<std::mutex> l(m_TransitTunnelsMutex);
+		for (auto it: m_TransitTunnels)
+		{
+			int t = it.second->GetCreationTime () + TUNNEL_EXPIRATION_TIMEOUT - ts;
+			if (t > timeout) timeout = t;
+		}	
+		return timeout;
 	}	
 }
 }

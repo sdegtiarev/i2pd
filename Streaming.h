@@ -7,8 +7,8 @@
 #include <set>
 #include <queue>
 #include <functional>
+#include <memory>
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
 #include "I2PEndian.h"
 #include "Identity.h"
 #include "LeaseSet.h"
@@ -45,23 +45,23 @@ namespace stream
 	
 	struct Packet
 	{
-		uint8_t buf[MAX_PACKET_SIZE];	
 		size_t len, offset;
+		uint8_t buf[MAX_PACKET_SIZE];	
 		int numResendAttempts;
 		
 		Packet (): len (0), offset (0), numResendAttempts (0) {};
 		uint8_t * GetBuffer () { return buf + offset; };
 		size_t GetLength () const { return len - offset; };
 
-		uint32_t GetSendStreamID () const { return be32toh (*(uint32_t *)buf); };
-		uint32_t GetReceiveStreamID () const { return be32toh (*(uint32_t *)(buf + 4)); };
-		uint32_t GetSeqn () const { return be32toh (*(uint32_t *)(buf + 8)); };
-		uint32_t GetAckThrough () const { return be32toh (*(uint32_t *)(buf + 12)); };
+		uint32_t GetSendStreamID () const { return bufbe32toh (buf); };
+		uint32_t GetReceiveStreamID () const { return bufbe32toh (buf + 4); };
+		uint32_t GetSeqn () const { return bufbe32toh (buf + 8); };
+		uint32_t GetAckThrough () const { return bufbe32toh (buf + 12); };
 		uint8_t GetNACKCount () const { return buf[16]; };
-		uint32_t GetNACK (int i) const { return be32toh (((uint32_t *)(buf + 17))[i]); };
+		uint32_t GetNACK (int i) const { return bufbe32toh (buf + 17 + 4 * i); };
 		const uint8_t * GetOption () const { return buf + 17 + GetNACKCount ()*4 + 3; }; // 3 = resendDelay + flags
-		uint16_t GetFlags () const { return be16toh (*(uint16_t *)(GetOption () - 2)); };
-		uint16_t GetOptionSize () const { return be16toh (*(uint16_t *)GetOption ()); };
+		uint16_t GetFlags () const { return bufbe16toh (GetOption () - 2); };
+		uint16_t GetOptionSize () const { return bufbe16toh (GetOption ()); };
 		const uint8_t * GetOptionData () const { return GetOption () + 2; };
 		const uint8_t * GetPayload () const { return GetOptionData () + GetOptionSize (); };
 
@@ -78,7 +78,7 @@ namespace stream
 	};	
 	
 	class StreamingDestination;
-	class Stream
+	class Stream: public std::enable_shared_from_this<Stream>
 	{	
 		public:
 
@@ -100,8 +100,10 @@ namespace stream
 			
 			template<typename Buffer, typename ReceiveHandler>
 			void AsyncReceive (const Buffer& buffer, ReceiveHandler handler, int timeout = 0);
-
+			size_t ReadSome (uint8_t * buf, size_t len) { return ConcatenatePackets (buf, len); };
+			
 			void Close ();
+			void Cancel () { m_ReceiveTimer.cancel (); };
 
 			size_t GetNumSentBytes () const { return m_NumSentBytes; };
 			size_t GetNumReceivedBytes () const { return m_NumReceivedBytes; };
@@ -112,6 +114,7 @@ namespace stream
 
 			void SendQuickAck ();
 			bool SendPacket (Packet * packet);
+			void PostPackets (const std::vector<Packet *> packets);
 			void SendPackets (const std::vector<Packet *>& packets);
 
 			void SavePacket (Packet * packet);
@@ -141,6 +144,7 @@ namespace stream
 			const i2p::data::LeaseSet * m_RemoteLeaseSet;
 			i2p::garlic::GarlicRoutingSession * m_RoutingSession;
 			i2p::data::Lease m_CurrentRemoteLease;
+			i2p::tunnel::OutboundTunnel * m_CurrentOutboundTunnel;
 			std::queue<Packet *> m_ReceiveQueue;
 			std::set<Packet *, PacketCmp> m_SavedPackets;
 			std::set<Packet *, PacketCmp> m_SentPackets;
@@ -153,7 +157,7 @@ namespace stream
 	{
 		public:
 
-			typedef std::function<void (Stream *)> Acceptor;
+			typedef std::function<void (std::shared_ptr<Stream>)> Acceptor;
 
 			StreamingDestination (i2p::client::ClientDestination& owner): m_Owner (owner) {};
 			~StreamingDestination () {};	
@@ -161,8 +165,8 @@ namespace stream
 			void Start ();
 			void Stop ();
 
-			Stream * CreateNewOutgoingStream (const i2p::data::LeaseSet& remote, int port = 0);
-			void DeleteStream (Stream * stream);			
+			std::shared_ptr<Stream> CreateNewOutgoingStream (const i2p::data::LeaseSet& remote, int port = 0);
+			void DeleteStream (std::shared_ptr<Stream> stream);			
 			void SetAcceptor (const Acceptor& acceptor) { m_Acceptor = acceptor; };
 			void ResetAcceptor () { m_Acceptor = nullptr; };
 			bool IsAcceptorSet () const { return m_Acceptor != nullptr; };	
@@ -173,13 +177,13 @@ namespace stream
 		private:		
 	
 			void HandleNextPacket (Packet * packet);
-			Stream * CreateNewIncomingStream ();
+			std::shared_ptr<Stream> CreateNewIncomingStream ();
 
 		private:
 
 			i2p::client::ClientDestination& m_Owner;
 			std::mutex m_StreamsMutex;
-			std::map<uint32_t, Stream *> m_Streams;
+			std::map<uint32_t, std::shared_ptr<Stream> > m_Streams;
 			Acceptor m_Acceptor;
 			
 		public:
@@ -188,8 +192,6 @@ namespace stream
 			const decltype(m_Streams)& GetStreams () const { return m_Streams; };
 	};		
 
-	void DeleteStream (Stream * stream);
-
 //-------------------------------------------------
 
 	template<typename Buffer, typename ReceiveHandler>
@@ -197,15 +199,17 @@ namespace stream
 	{
 		if (!m_ReceiveQueue.empty ())
 		{
-			m_Service.post ([=](void) { this->HandleReceiveTimer (
+			auto s = shared_from_this();
+			m_Service.post ([=](void) { s->HandleReceiveTimer (
 				boost::asio::error::make_error_code (boost::asio::error::operation_aborted),
 				buffer, handler); });
 		}
 		else
 		{
 			m_ReceiveTimer.expires_from_now (boost::posix_time::seconds(timeout));
+			auto s = shared_from_this();
 			m_ReceiveTimer.async_wait ([=](const boost::system::error_code& ecode)
-				{ this->HandleReceiveTimer (ecode, buffer, handler); });
+				{ s->HandleReceiveTimer (ecode, buffer, handler); });
 		}
 	}
 
@@ -220,9 +224,19 @@ namespace stream
 				// no error
 				handler (boost::system::error_code (), received); 
 			else
-				// socket closed
-				handler (m_IsReset ? boost::asio::error::make_error_code (boost::asio::error::connection_reset) :
-					boost::asio::error::make_error_code (boost::asio::error::operation_aborted), 0);
+			{	
+				// stream closed
+				if (m_IsReset)
+				{
+					// stream closed by peer
+					handler (received > 0 ? boost::system::error_code () : // we still have some data
+						boost::asio::error::make_error_code (boost::asio::error::connection_reset), // no more data
+						received);
+					
+				}
+				else // stream closed by us
+					handler (boost::asio::error::make_error_code (boost::asio::error::operation_aborted), received); 
+			}	
 		}	
 		else
 			// timeout expired

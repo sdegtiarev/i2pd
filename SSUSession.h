@@ -3,8 +3,7 @@
 
 #include <inttypes.h>
 #include <set>
-#include <list>
-#include <boost/asio.hpp>
+#include <memory>
 #include "aes.h"
 #include "hmac.h"
 #include "I2NPProtocol.h"
@@ -50,7 +49,7 @@ namespace transport
 	};	
 
 	class SSUServer;
-	class SSUSession: public TransportSession
+	class SSUSession: public TransportSession, public std::enable_shared_from_this<SSUSession>
 	{
 		public:
 
@@ -60,12 +59,14 @@ namespace transport
 			~SSUSession ();
 			
 			void Connect ();
+			void WaitForConnect ();
 			void Introduce (uint32_t iTag, const uint8_t * iKey);
 			void WaitForIntroduction ();
 			void Close ();
 			boost::asio::ip::udp::endpoint& GetRemoteEndpoint () { return m_RemoteEndpoint; };
 			bool IsV6 () const { return m_RemoteEndpoint.address ().is_v6 (); };
 			void SendI2NPMessage (I2NPMessage * msg);
+			void SendI2NPMessages (const std::vector<I2NPMessage *>& msgs);
 			void SendPeerTest (); // Alice			
 
 			SessionState GetState () const  { return m_State; };
@@ -81,6 +82,7 @@ namespace transport
 			void CreateAESandMacKey (const uint8_t * pubKey); 
 
 			void PostI2NPMessage (I2NPMessage * msg);
+			void PostI2NPMessages (std::vector<I2NPMessage *> msgs);
 			void ProcessMessage (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint); // call for established session
 			void ProcessSessionRequest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint);
 			void SendSessionRequest ();
@@ -131,7 +133,6 @@ namespace transport
 			i2p::crypto::CBCDecryption m_SessionKeyDecryption;
 			i2p::crypto::AESKey m_SessionKey;
 			i2p::crypto::MACKey m_MacKey;
-			std::list<i2p::I2NPMessage *> m_DelayedMessages;
 			SSUData m_Data;
 			size_t m_NumSentBytes, m_NumReceivedBytes;
 			uint32_t m_CreationTime; // seconds since epoch

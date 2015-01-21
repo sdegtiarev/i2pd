@@ -25,7 +25,7 @@ namespace crypto
 		"movaps	%%xmm3, %%xmm4 \n" \
 		"pslldq	$4, %%xmm4 \n" \
 		"pxor %%xmm4, %%xmm3 \n" \
-	    "pslldq	$4, %%xmm4 \n" \
+		"pslldq	$4, %%xmm4 \n" \
 		"pxor %%xmm4, %%xmm3 \n" \
 		"pslldq	$4, %%xmm4 \n" \
 		"pxor %%xmm4, %%xmm3 \n" \
@@ -66,7 +66,7 @@ namespace crypto
 			"movups	%%xmm1, 224(%[sched]) \n"
 			: // output
 			: [key]"r"((const uint8_t *)key), [sched]"r"(GetKeySchedule ()) // input
-			: "%xmm1", "%xmm2", "%xmm3", "%xmm4" // clogged
+			: "%xmm1", "%xmm2", "%xmm3", "%xmm4", "memory" // clogged
 		);
 	}
 
@@ -94,7 +94,7 @@ namespace crypto
 			"movups	(%[in]), %%xmm0 \n"
 			EncryptAES256(sched)
 			"movups	%%xmm0, (%[out]) \n"	
-			: : [sched]"r"(GetKeySchedule ()), [in]"r"(in), [out]"r"(out) : "%xmm0"
+			: : [sched]"r"(GetKeySchedule ()), [in]"r"(in), [out]"r"(out) : "%xmm0", "memory"
 		);
 	}		
 
@@ -122,7 +122,7 @@ namespace crypto
 			"movups	(%[in]), %%xmm0 \n"
 			DecryptAES256(sched)
 			"movups	%%xmm0, (%[out]) \n"	
-			: : [sched]"r"(GetKeySchedule ()), [in]"r"(in), [out]"r"(out) : "%xmm0"
+			: : [sched]"r"(GetKeySchedule ()), [in]"r"(in), [out]"r"(out) : "%xmm0", "memory"
 		);		
 	}
 
@@ -150,7 +150,7 @@ namespace crypto
 			CallAESIMC(176)
 			CallAESIMC(192)
 			CallAESIMC(208)
-			: : [shed]"r"(GetKeySchedule ()) : "%xmm0"
+			: : [shed]"r"(GetKeySchedule ()) : "%xmm0", "memory"
 		);
 	}
 
@@ -163,7 +163,7 @@ namespace crypto
 		__asm__
 		(
 		 	"movups	(%[iv]), %%xmm1 \n"
-		 	"block_e: \n"
+		 	"1: \n"
 		 	"movups	(%[in]), %%xmm0 \n"
 		 	"pxor %%xmm1, %%xmm0 \n"
 		 	EncryptAES256(sched)
@@ -172,7 +172,7 @@ namespace crypto
 		 	"add $16, %[in] \n"
 		 	"add $16, %[out] \n"
 		 	"dec %[num] \n"
-		 	"jnz block_e; \n"	 	
+		 	"jnz 1b \n"	 	
 		 	"movups	%%xmm1, (%[iv]) \n"
 			: 
 			: [iv]"r"(&m_LastBlock), [sched]"r"(m_ECBEncryption.GetKeySchedule ()), 
@@ -222,7 +222,7 @@ namespace crypto
 		__asm__
 		(
 			"movups	(%[iv]), %%xmm1 \n"
-		 	"block_d: \n"
+		 	"1: \n"
 		 	"movups	(%[in]), %%xmm0 \n"
 			"movaps %%xmm0, %%xmm2 \n"
 		 	DecryptAES256(sched)
@@ -232,7 +232,7 @@ namespace crypto
 		 	"add $16, %[in] \n"
 		 	"add $16, %[out] \n"
 		 	"dec %[num] \n"
-		 	"jnz block_d; \n"	 	
+		 	"jnz 1b \n"	 	
 		 	"movups	%%xmm1, (%[iv]) \n"
 			: 
 			: [iv]"r"(&m_IV), [sched]"r"(m_ECBDecryption.GetKeySchedule ()), 
@@ -289,7 +289,7 @@ namespace crypto
 			EncryptAES256(sched_iv)
 			"movups %%xmm0, (%[payload]) \n"
 			// encrypt data, IV is xmm1
-			"block_et: \n"
+			"1: \n"
 			"add $16, %[payload] \n"
 		 	"movups	(%[payload]), %%xmm0 \n"
 		 	"pxor %%xmm1, %%xmm0 \n"
@@ -297,7 +297,7 @@ namespace crypto
 		 	"movaps	%%xmm0, %%xmm1 \n"	
 		 	"movups	%%xmm0, (%[payload]) \n"
 		 	"dec %[num] \n"
-		 	"jnz block_et; \n"	 	
+		 	"jnz 1b \n"	 	
 			: 
 			: [sched_iv]"r"(m_IVEncryption.GetKeySchedule ()), [sched_l]"r"(m_LayerEncryption.GetKeySchedule ()), 
 			  [payload]"r"(payload), [num]"r"(63) // 63 blocks = 1008 bytes
@@ -324,7 +324,7 @@ namespace crypto
 			DecryptAES256(sched_iv)
 			"movups %%xmm0, (%[payload]) \n"
 			// decrypt data, IV is xmm1
-			"block_dt: \n"
+			"1: \n"
 			"add $16, %[payload] \n"
 			"movups	(%[payload]), %%xmm0 \n"
 			"movaps %%xmm0, %%xmm2 \n"
@@ -333,7 +333,7 @@ namespace crypto
 		 	"movups	%%xmm0, (%[payload]) \n"
 			"movaps %%xmm2, %%xmm1 \n"
 		 	"dec %[num] \n"
-		 	"jnz block_dt; \n"	 	
+		 	"jnz 1b \n"	 	
 			: 
 			: [sched_iv]"r"(m_IVDecryption.GetKeySchedule ()), [sched_l]"r"(m_LayerDecryption.GetKeySchedule ()), 
 			  [payload]"r"(payload), [num]"r"(63) // 63 blocks = 1008 bytes

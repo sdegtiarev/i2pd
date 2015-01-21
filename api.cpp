@@ -21,9 +21,12 @@ namespace api
 		i2p::context.Init ();	
 	}
 
-	void StartI2P ()
+	void StartI2P (std::ostream * logStream)
 	{
-		StartLog (i2p::util::filesystem::GetAppName () + ".log");
+		if (logStream)
+			StartLog (logStream);
+		else
+			StartLog (i2p::util::filesystem::GetAppName () + ".log");
 		i2p::data::netdb.Start();
 		LogPrint("NetDB started");
 		i2p::transport::transports.Start();
@@ -44,16 +47,19 @@ namespace api
 		StopLog ();
 	}
 
-	i2p::client::ClientDestination * CreateLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic)
+	i2p::client::ClientDestination * CreateLocalDestination (const i2p::data::PrivateKeys& keys, bool isPublic,
+		const std::map<std::string, std::string> * params)
 	{
-		auto localDestination = new i2p::client::ClientDestination (keys, isPublic);
+		auto localDestination = new i2p::client::ClientDestination (keys, isPublic, params);
 		localDestination->Start ();
 		return localDestination;
 	}
 
-	i2p::client::ClientDestination * CreateLocalDestination (bool isPublic, i2p::data::SigningKeyType sigType)
+	i2p::client::ClientDestination * CreateLocalDestination (bool isPublic, i2p::data::SigningKeyType sigType,
+		const std::map<std::string, std::string> * params)
 	{
-		auto localDestination = new i2p::client::ClientDestination (isPublic, sigType);
+		i2p::data::PrivateKeys keys = i2p::data::PrivateKeys::CreateRandomKeys (sigType);
+		auto localDestination = new i2p::client::ClientDestination (keys, isPublic, params);
 		localDestination->Start ();
 		return localDestination;
 	}
@@ -70,12 +76,13 @@ namespace api
 	void RequestLeaseSet (i2p::client::ClientDestination * dest, const i2p::data::IdentHash& remote)
 	{
 		if (dest)
-			i2p::data::netdb.RequestDestination (remote, true, dest->GetTunnelPool ());
+			dest->RequestDestination (remote);
 	}
 
-	i2p::stream::Stream * CreateStream (i2p::client::ClientDestination * dest, const i2p::data::IdentHash& remote)
+	std::shared_ptr<i2p::stream::Stream> CreateStream (i2p::client::ClientDestination * dest, const i2p::data::IdentHash& remote)
 	{
-		auto leaseSet = i2p::data::netdb.FindLeaseSet (remote);
+		if (!dest) return nullptr;
+		auto leaseSet = dest->FindLeaseSet (remote);
 		if (leaseSet)
 		{
 			auto stream = dest->CreateStream (*leaseSet);
@@ -95,13 +102,10 @@ namespace api
 			dest->AcceptStreams (acceptor);
 	}
 
-	void DestroyStream (i2p::stream::Stream * stream)
+	void DestroyStream (std::shared_ptr<i2p::stream::Stream> stream)
 	{
 		if (stream)
-		{
 			stream->Close ();
-			i2p::stream::DeleteStream (stream);
-		}
 	}
 }
 }

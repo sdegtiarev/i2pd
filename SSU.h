@@ -31,22 +31,24 @@ namespace transport
 			~SSUServer ();
 			void Start ();
 			void Stop ();
-			SSUSession * GetSession (std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest = false);
-			SSUSession * FindSession (const i2p::data::RouterInfo * router) const;
-			SSUSession * FindSession (const boost::asio::ip::udp::endpoint& e) const;
-			SSUSession * GetRandomEstablishedSession (const SSUSession * excluded);
-			void DeleteSession (SSUSession * session);
+			std::shared_ptr<SSUSession> GetSession (std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest = false);
+			std::shared_ptr<SSUSession> FindSession (std::shared_ptr<const i2p::data::RouterInfo> router) const;
+			std::shared_ptr<SSUSession> FindSession (const boost::asio::ip::udp::endpoint& e) const;
+			std::shared_ptr<SSUSession> GetRandomEstablishedSession (std::shared_ptr<const SSUSession> excluded);
+			void DeleteSession (std::shared_ptr<SSUSession> session);
 			void DeleteAllSessions ();			
 
-			boost::asio::io_service& GetService () { return m_Socket.get_io_service(); };
+			boost::asio::io_service& GetService () { return m_Service; };
+			boost::asio::io_service& GetServiceV6 () { return m_ServiceV6; };
 			const boost::asio::ip::udp::endpoint& GetEndpoint () const { return m_Endpoint; };			
 			void Send (const uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& to);
 			void AddRelay (uint32_t tag, const boost::asio::ip::udp::endpoint& relay);
-			SSUSession * FindRelaySession (uint32_t tag);
+			std::shared_ptr<SSUSession> FindRelaySession (uint32_t tag);
 
 		private:
 
 			void Run ();
+			void RunV6 ();
 			void Receive ();
 			void ReceiveV6 ();
 			void HandleReceivedFrom (const boost::system::error_code& ecode, std::size_t bytes_transferred);
@@ -54,7 +56,7 @@ namespace transport
 			void HandleReceivedBuffer (boost::asio::ip::udp::endpoint& from, uint8_t * buf, std::size_t bytes_transferred);
 
 			template<typename Filter>
-			SSUSession * GetRandomSession (Filter filter);
+			std::shared_ptr<SSUSession> GetRandomSession (Filter filter);
 			
 			std::set<SSUSession *> FindIntroducers (int maxNumIntroducers);	
 			void ScheduleIntroducersUpdateTimer ();
@@ -63,9 +65,9 @@ namespace transport
 		private:
 
 			bool m_IsRunning;
-			std::thread * m_Thread;	
-			boost::asio::io_service m_Service;
-			boost::asio::io_service::work m_Work;
+			std::thread * m_Thread, * m_ThreadV6;	
+			boost::asio::io_service m_Service, m_ServiceV6;
+			boost::asio::io_service::work m_Work, m_WorkV6;
 			boost::asio::ip::udp::endpoint m_Endpoint, m_EndpointV6;
 			boost::asio::ip::udp::socket m_Socket, m_SocketV6;
 			boost::asio::ip::udp::endpoint m_SenderEndpoint, m_SenderEndpointV6;
@@ -73,7 +75,7 @@ namespace transport
 			std::list<boost::asio::ip::udp::endpoint> m_Introducers; // introducers we are connected to
 			i2p::crypto::AESAlignedBuffer<2*SSU_MTU_V4> m_ReceiveBuffer;
 			i2p::crypto::AESAlignedBuffer<2*SSU_MTU_V6> m_ReceiveBufferV6; 
-			std::map<boost::asio::ip::udp::endpoint, SSUSession *> m_Sessions;
+			std::map<boost::asio::ip::udp::endpoint, std::shared_ptr<SSUSession> > m_Sessions;
 			std::map<uint32_t, boost::asio::ip::udp::endpoint> m_Relays; // we are introducer
 
 		public:

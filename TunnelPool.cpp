@@ -10,9 +10,9 @@ namespace i2p
 {
 namespace tunnel
 {
-	TunnelPool::TunnelPool (i2p::garlic::GarlicDestination& localDestination, int numHops, int numTunnels):
-		m_LocalDestination (localDestination), m_NumHops (numHops), m_NumTunnels (numTunnels),
-		m_IsActive (true)
+	TunnelPool::TunnelPool (i2p::garlic::GarlicDestination * localDestination, int numInboundHops, int numOutboundHops, int numTunnels):
+		m_LocalDestination (localDestination), m_NumInboundHops (numInboundHops), m_NumOutboundHops (numOutboundHops),
+		m_NumTunnels (numTunnels), m_IsActive (true)
 	{
 	}
 
@@ -45,7 +45,8 @@ namespace tunnel
 			std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 			m_InboundTunnels.insert (createdTunnel);
 		}
-		m_LocalDestination.SetLeaseSetUpdated ();
+		if (m_LocalDestination)
+			m_LocalDestination->SetLeaseSetUpdated ();
 	}
 
 	void TunnelPool::TunnelExpired (InboundTunnel * expiredTunnel)
@@ -183,13 +184,15 @@ namespace tunnel
 						std::unique_lock<std::mutex> l(m_InboundTunnelsMutex);
 						m_InboundTunnels.erase (it.second.second);
 					}
-					m_LocalDestination.SetLeaseSetUpdated ();
+					if (m_LocalDestination)
+						m_LocalDestination->SetLeaseSetUpdated ();
 				}	
 				else
 					it.second.second->SetState (eTunnelStateTestFailed);
 			}	
 		}
-		m_Tests.clear ();	
+		m_Tests.clear ();
+		// new tests	
 		auto it1 = m_OutboundTunnels.begin ();
 		auto it2 = m_InboundTunnels.begin ();
 		while (it1 != m_OutboundTunnels.end () && it2 != m_InboundTunnels.end ())
@@ -207,19 +210,34 @@ namespace tunnel
 			}
 			if (!failed)
 			{
-				uint32_t msgID = rnd.GenerateWord32 ();
-				m_Tests[msgID] = std::make_pair (*it1, *it2);
-				(*it1)->SendTunnelDataMsg ((*it2)->GetNextIdentHash (), (*it2)->GetNextTunnelID (),
+ 				uint32_t msgID = rnd.GenerateWord32 ();
+ 				m_Tests[msgID] = std::make_pair (*it1, *it2);
+ 				(*it1)->SendTunnelDataMsg ((*it2)->GetNextIdentHash (), (*it2)->GetNextTunnelID (),
 					CreateDeliveryStatusMsg (msgID));
 				it1++; it2++;
 			}	
 		}
 	}
 
+	void TunnelPool::ProcessGarlicMessage (I2NPMessage * msg)
+	{
+		if (m_LocalDestination)
+			m_LocalDestination->ProcessGarlicMessage (msg);
+		else
+		{
+			LogPrint (eLogWarning, "Local destination doesn't exist. Dropped");
+			DeleteI2NPMessage (msg);
+		}	
+	}	
+		
 	void TunnelPool::ProcessDeliveryStatus (I2NPMessage * msg)
 	{
-		I2NPDeliveryStatusMsg * deliveryStatus = (I2NPDeliveryStatusMsg *)msg->GetPayload ();
-		auto it = m_Tests.find (be32toh (deliveryStatus->msgID));
+		const uint8_t * buf = msg->GetPayload ();
+		uint32_t msgID = bufbe32toh (buf);
+		buf += 4;	
+		uint64_t timestamp = bufbe64toh (buf);
+
+		auto it = m_Tests.find (msgID);
 		if (it != m_Tests.end ())
 		{
 			// restore from test failed state if any
@@ -227,18 +245,28 @@ namespace tunnel
 				it->second.first->SetState (eTunnelStateEstablished);
 			if (it->second.second->GetState () == eTunnelStateTestFailed)
 				it->second.second->SetState (eTunnelStateEstablished);
-			LogPrint ("Tunnel test ", it->first, " successive. ", i2p::util::GetMillisecondsSinceEpoch () - be64toh (deliveryStatus->timestamp), " milliseconds");
+			LogPrint ("Tunnel test ", it->first, " successive. ", i2p::util::GetMillisecondsSinceEpoch () - timestamp, " milliseconds");
 			m_Tests.erase (it);
 			DeleteI2NPMessage (msg);
 		}
 		else
-			m_LocalDestination.ProcessDeliveryStatusMessage (msg);
+		{
+			if (m_LocalDestination)
+				m_LocalDestination->ProcessDeliveryStatusMessage (msg);
+			else
+			{	
+				LogPrint (eLogWarning, "Local destination doesn't exist. Dropped");
+				DeleteI2NPMessage (msg);
+			}	
+		}	
 	}
 
 	std::shared_ptr<const i2p::data::RouterInfo> TunnelPool::SelectNextHop (std::shared_ptr<const i2p::data::RouterInfo> prevHop) const
 	{
-		auto hop = m_NumHops >= 3 ? i2p::data::netdb.GetHighBandwidthRandomRouter (prevHop) :
-			i2p::data::netdb.GetRandomRouter (prevHop);
+		bool isExploratory = (m_LocalDestination == &i2p::context); // TODO: implement it better
+		auto hop =  isExploratory ? i2p::data::netdb.GetRandomRouter (prevHop): 
+			i2p::data::netdb.GetHighBandwidthRandomRouter (prevHop);
+			
 		if (!hop)
 			hop = i2p::data::netdb.GetRandomRouter ();
 		return hop;	
@@ -252,7 +280,7 @@ namespace tunnel
 		LogPrint ("Creating destination inbound tunnel...");
 		auto prevHop = i2p::context.GetSharedRouterInfo ();	
 		std::vector<std::shared_ptr<const i2p::data::RouterInfo> > hops;
-		int numHops = m_NumHops;
+		int numHops = m_NumInboundHops;
 		if (outboundTunnel)
 		{	
 			// last hop
@@ -272,7 +300,7 @@ namespace tunnel
 		}		
 		std::reverse (hops.begin (), hops.end ());	
 		auto * tunnel = tunnels.CreateTunnel<InboundTunnel> (new TunnelConfig (hops), outboundTunnel);
-		tunnel->SetTunnelPool (this);
+		tunnel->SetTunnelPool (shared_from_this ());
 	}
 
 	void TunnelPool::RecreateInboundTunnel (InboundTunnel * tunnel)
@@ -282,7 +310,7 @@ namespace tunnel
 			outboundTunnel = tunnels.GetNextOutboundTunnel ();
 		LogPrint ("Re-creating destination inbound tunnel...");
 		auto * newTunnel = tunnels.CreateTunnel<InboundTunnel> (tunnel->GetTunnelConfig ()->Clone (), outboundTunnel);
-		newTunnel->SetTunnelPool (this);
+		newTunnel->SetTunnelPool (shared_from_this());
 	}	
 		
 	void TunnelPool::CreateOutboundTunnel ()
@@ -296,7 +324,7 @@ namespace tunnel
 
 			auto prevHop = i2p::context.GetSharedRouterInfo ();
 			std::vector<std::shared_ptr<const i2p::data::RouterInfo> > hops;
-			for (int i = 0; i < m_NumHops; i++)
+			for (int i = 0; i < m_NumOutboundHops; i++)
 			{
 				auto hop = SelectNextHop (prevHop);
 				prevHop = hop;
@@ -305,7 +333,7 @@ namespace tunnel
 				
 			auto * tunnel = tunnels.CreateTunnel<OutboundTunnel> (
 				new TunnelConfig (hops, inboundTunnel->GetTunnelConfig ()));
-			tunnel->SetTunnelPool (this);
+			tunnel->SetTunnelPool (shared_from_this ());
 		}	
 		else
 			LogPrint ("Can't create outbound tunnel. No inbound tunnels found");
@@ -321,7 +349,7 @@ namespace tunnel
 			LogPrint ("Re-creating destination outbound tunnel...");
 			auto * newTunnel = tunnels.CreateTunnel<OutboundTunnel> (
 				tunnel->GetTunnelConfig ()->Clone (inboundTunnel->GetTunnelConfig ()));
-			newTunnel->SetTunnelPool (this);
+			newTunnel->SetTunnelPool (shared_from_this ());
 		}	
 		else
 			LogPrint ("Can't re-create outbound tunnel. No inbound tunnels found");

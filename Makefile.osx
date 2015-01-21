@@ -1,18 +1,25 @@
 CXX = clang++
-CXXFLAGS = -g -Wall -std=c++11 -lstdc++ -I/usr/local/include
-include filelist.mk
-INCFLAGS = -DCRYPTOPP_DISABLE_ASM
+CXXFLAGS = -g -Wall -std=c++11 -DCRYPTOPP_DISABLE_ASM -DMAC_OSX
+#CXXFLAGS = -g -O2 -Wall -std=c++11 -DCRYPTOPP_DISABLE_ASM
+INCFLAGS = -I/usr/local/include
 LDFLAGS = -Wl,-rpath,/usr/local/lib -L/usr/local/lib
 LDLIBS = -lcryptopp -lboost_system -lboost_date_time -lboost_filesystem -lboost_regex -lboost_program_options -lpthread
-LIBS =
+
+ifeq ($(USE_UPNP),1)
+  LDFLAGS += -ldl
+  CXXFLAGS += -DUSE_UPNP
+endif
 
 # OSX Notes
 # http://www.hutsby.net/2011/08/macs-with-aes-ni.html
 # Seems like all recent Mac's have AES-NI, after firmware upgrade 2.2
 # Found no good way to detect it from command line. TODO: Might be some osx sysinfo magic
-CXXFLAGS += -maes -DAESNI
-
-# Apple Mac OSX
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
+ifeq ($(USE_AESNI),yes)
+  CXXFLAGS += -maes -DAESNI
 endif
+
+# Disabled, since it will be the default make rule. I think its better
+# to define the default rule in Makefile and not Makefile.<ostype> - torkel
+#install: all
+#	test -d ${PREFIX} || mkdir -p ${PREFIX}/
+#	cp -r i2p ${PREFIX}/

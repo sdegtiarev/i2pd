@@ -36,18 +36,15 @@ namespace datagram
 		else
 			m_Owner.Sign (buf1, len, signature);
 		
-		auto service = m_Owner.GetService ();
-		if (service) 
-			service->post (boost::bind (&DatagramDestination::SendMsg, this, 
-				CreateDataMessage (buf, len + headerLen), remote));
-		else
-			LogPrint (eLogWarning, "Failed to send datagram. Destination is not running");
+		m_Owner.GetService ().post (std::bind (&DatagramDestination::SendMsg, this, 
+			CreateDataMessage (buf, len + headerLen), remote));
 	}
 
 	void DatagramDestination::SendMsg (I2NPMessage * msg, const i2p::data::LeaseSet& remote)
 	{
+		auto outboundTunnel = m_Owner.GetTunnelPool ()->GetNextOutboundTunnel ();
 		auto leases = remote.GetNonExpiredLeases ();
-		if (!leases.empty ())
+		if (!leases.empty () && outboundTunnel)
 		{
 			std::vector<i2p::tunnel::TunnelMessageBlock> msgs;			
 			uint32_t i = i2p::context.GetRandomNumberGenerator ().GenerateWord32 (0, leases.size () - 1);
@@ -58,11 +55,14 @@ namespace datagram
 					leases[i].tunnelGateway, leases[i].tunnelID,
 					garlic
 				});
-			m_Owner.SendTunnelDataMsgs (msgs);
+			outboundTunnel->SendTunnelDataMsg (msgs);
 		}
 		else
 		{
-			LogPrint (eLogWarning, "Failed to send datagram. All leases expired");
+			if (outboundTunnel)
+				LogPrint (eLogWarning, "Failed to send datagram. All leases expired");
+			else
+				LogPrint (eLogWarning, "Failed to send datagram. No outbound tunnels");
 			DeleteI2NPMessage (msg);	
 		}	
 	}
@@ -76,11 +76,7 @@ namespace datagram
 
 		bool verified = false;
 		if (identity.GetSigningKeyType () == i2p::data::SIGNING_KEY_TYPE_DSA_SHA1)
-		{
-			uint8_t hash[32];	
-			CryptoPP::SHA256().CalculateDigest (hash, buf + headerLen, len - headerLen);
-			verified = identity.Verify (hash, 32, signature);
-		}
+			verified = CryptoPP::SHA256().VerifyDigest (signature, buf + headerLen, len - headerLen);
 		else	
 			verified = identity.Verify (buf + headerLen, len - headerLen, signature);
 				
@@ -121,7 +117,7 @@ namespace datagram
 		compressor.MessageEnd();
 		int size = compressor.MaxRetrievable ();
 		uint8_t * buf = msg->GetPayload ();
-		*(uint32_t *)buf = htobe32 (size); // length
+		htobe32buf (buf, size); // length
 		buf += 4;
 		compressor.Get (buf, size);
 		memset (buf + 4, 0, 4); // source and destination are zeroes
