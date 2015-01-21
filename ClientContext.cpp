@@ -3,6 +3,7 @@
 #include "Log.h"
 #include "Identity.h"
 #include "ClientContext.h"
+#include "HTTPAutoConf.h"
 
 namespace i2p
 {
@@ -38,6 +39,7 @@ namespace client
 		}
 
 		m_HttpProxy = new i2p::proxy::HTTPProxy(i2p::util::config::GetArg("-httpproxyport", 4446));
+		/*auto proxyconf=*/new i2p::proxy::autoconf(m_HttpProxy, i2p::util::config::GetArg("-httpautoconf", 4448));
 		m_HttpProxy->Start();
 		LogPrint("HTTP Proxy started");
 		m_SocksProxy = new i2p::proxy::SOCKSProxy(i2p::util::config::GetArg("-socksproxyport", 4447));
