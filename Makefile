@@ -21,7 +21,6 @@ else ifeq ($(UNAME),Linux)
 else # win32
 	DAEMON_SRC += DaemonWin32.cpp
 endif
-CXXFLAGS= $(CFLAGS)
 
 all: mk_build_dir $(SHLIB) $(I2PD)
 
@@ -58,17 +57,17 @@ ifneq ($(USE_STATIC),yes)
 endif
 
 clean:
-	rm -fr obj i2p
-	
-io: io.cc
-	g++ -g -std=c++11 io.cc -o io -lboost_system
+	rm -rf obj
+	$(RM) $(I2PD) $(SHLIB)
 
-ios: ios.cc
-	g++ -g -std=c++11 $< -o$@ -lboost_system
-
+LATEST_TAG=$(shell git describe --tags --abbrev=0 master)
+dist:
+	git archive --format=tar.gz -9 --worktree-attributes \
+	    --prefix=i2pd_$(LATEST_TAG)/ $(LATEST_TAG) -o i2pd_$(LATEST_TAG).tar.gz
 
 .PHONY: all
 .PHONY: clean
-
-ver:
-	@echo $(CXXVER) flags: $(CFLAGS)
+.PHONY: deps
+.PHONY: dist
+.PHONY: api
+.PHONY: mk_build_dir
