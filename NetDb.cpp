@@ -22,7 +22,7 @@ namespace i2p
 namespace data
 {		
 	I2NPMessage * RequestedDestination::CreateRequestMessage (std::shared_ptr<const RouterInfo> router,
-		const i2p::tunnel::InboundTunnel * replyTunnel)
+		std::shared_ptr<const i2p::tunnel::InboundTunnel> replyTunnel)
 	{
 		I2NPMessage * msg = i2p::CreateRouterInfoDatabaseLookupMsg (m_Destination, 
 			replyTunnel->GetNextIdentHash (), replyTunnel->GetNextTunnelID (), m_IsExploratory, 
@@ -116,17 +116,13 @@ namespace data
 			delete m_Thread;
 			m_Thread = 0;
 		}
-		for (auto l: m_LeaseSets)
-			delete l.second;
 		m_LeaseSets.clear();
-		for (auto r: m_RequestedDestinations)
-			delete r.second;
 		m_RequestedDestinations.clear ();
 	}	
 	
 	void NetDb::Run ()
 	{
-		uint32_t lastSave = 0, lastPublish = 0, lastExploratory = 0;
+		uint32_t lastSave = 0, lastPublish = 0, lastExploratory = 0, lastManageRequest = 0;
 		while (m_IsRunning)
 		{	
 			try
@@ -134,6 +130,7 @@ namespace data
 				I2NPMessage * msg = m_Queue.GetNextWithTimeout (15000); // 15 sec
 				if (msg)
 				{	
+					int numMsgs = 0;	
 					while (msg)
 					{
 						switch (msg->GetTypeID ()) 
@@ -154,16 +151,19 @@ namespace data
 								LogPrint ("NetDb: unexpected message type ", msg->GetTypeID ());
 								i2p::HandleI2NPMessage (msg);
 						}	
+						if (numMsgs > 100) break;
 						msg = m_Queue.Get ();
+						numMsgs++;
 					}	
-				}
-				else 				
-				{
-					if (!m_IsRunning) break;
-					ManageRequests ();
-				}
+				}			
+				if (!m_IsRunning) break;
 
 				uint64_t ts = i2p::util::GetSecondsSinceEpoch ();
+				if (ts - lastManageRequest >= 15) // manage requests every 15 seconds
+				{
+					ManageRequests ();
+					lastManageRequest = ts;
+				}	
 				if (ts - lastSave >= 60) // save routers, manage leasesets and validate subscriptions every minute
 				{
 					if (lastSave)
@@ -185,7 +185,8 @@ namespace data
 					{	
 						numRouters = 800/numRouters;
 						if (numRouters < 1) numRouters = 1;
-						if (numRouters > 9) numRouters = 9;						
+						if (numRouters > 9) numRouters = 9;	
+						ManageRequests ();					
 						Explore (numRouters);
 						lastExploratory = ts;
 					}	
@@ -235,13 +236,12 @@ namespace data
 		{	
 			it->second->Success (r);
 			std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
-			delete it->second;
 			m_RequestedDestinations.erase (it);
 		}	
 	}	
 
 	void NetDb::AddLeaseSet (const IdentHash& ident, const uint8_t * buf, int len,
-		i2p::tunnel::InboundTunnel * from)
+		std::shared_ptr<i2p::tunnel::InboundTunnel> from)
 	{
 		if (!from) // unsolicited LS must be received directly
 		{	
@@ -254,7 +254,7 @@ namespace data
 			else
 			{	
 				LogPrint ("New LeaseSet added");
-				m_LeaseSets[ident] = new LeaseSet (buf, len);
+				m_LeaseSets[ident] = std::make_shared<LeaseSet> (buf, len);
 			}	
 		}	
 	}	
@@ -269,7 +269,7 @@ namespace data
 			return nullptr;
 	}
 
-	LeaseSet * NetDb::FindLeaseSet (const IdentHash& destination) const
+	std::shared_ptr<LeaseSet> NetDb::FindLeaseSet (const IdentHash& destination) const
 	{
 		auto it = m_LeaseSets.find (destination);
 		if (it != m_LeaseSets.end ())
@@ -403,22 +403,37 @@ namespace data
 			{
 				it.second->SaveToFile (GetFilePath(fullDirectory, it.second.get ()));
 				it.second->SetUpdated (false);
+				it.second->SetUnreachable (false);
 				it.second->DeleteBuffer ();
 				count++;
 			}
 			else 
 			{
 				// RouterInfo expires after 1 hour if uses introducer
-				if ((it.second->UsesIntroducer () && ts > it.second->GetTimestamp () + 3600*1000LL) // 1 hour
-				// RouterInfo expires in 72 hours if more than 300
-					|| (total > 300 && ts > it.second->GetTimestamp () + 3*24*3600*1000LL)) // 3 days
-				{	
-					total--;
+				if (it.second->UsesIntroducer () && ts > it.second->GetTimestamp () + 3600*1000LL) // 1 hour
 					it.second->SetUnreachable (true);
-				}	
+				else if (total > 25 && ts > (i2p::context.GetStartupTime () + 600)*1000LL) // routers don't expire if less than 25 or uptime is less than 10 minutes
+				{
+					if (i2p::context.IsFloodfill ())
+					{
+						if (ts > it.second->GetTimestamp () + 3600*1000LL) // 1 hours
+							it.second->SetUnreachable (true);
+					}
+					else if (total > 300)
+					{
+						if (ts > it.second->GetTimestamp () + 30*3600*1000LL) // 30 hours
+							it.second->SetUnreachable (true);
+					}
+					else if (total > 120)
+					{
+						if (ts > it.second->GetTimestamp () + 72*3600*1000LL) // 72 hours
+							it.second->SetUnreachable (true);
+					}
+				}
 				
 				if (it.second->IsUnreachable ())
 				{	
+					total--;
 					// delete RI file
 					if (boost::filesystem::exists (GetFilePath (fullDirectory, it.second.get ())))
 					{    
@@ -454,9 +469,18 @@ namespace data
 	void NetDb::RequestDestination (const IdentHash& destination, RequestedDestination::RequestComplete requestComplete)
 	{
 		// request RouterInfo directly
-		RequestedDestination * dest = CreateRequestedDestination (destination, false);
-		if (requestComplete)
-			dest->SetRequestComplete (requestComplete);
+		auto dest = new RequestedDestination (destination, false); // non-exploratory
+		dest->SetRequestComplete (requestComplete);
+		{
+			std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
+			if (!m_RequestedDestinations.insert (std::make_pair (destination, 
+				std::unique_ptr<RequestedDestination> (dest))).second) // not inserted
+			{	
+				LogPrint (eLogWarning, "Destination ", destination.ToBase64(), " is requested already");
+				return; 
+			}	
+		}
+				
 		auto floodfill = GetClosestFloodfill (destination, dest->GetExcludedPeers ());
 		if (floodfill)
 			transports.SendMessage (floodfill->GetIdentHash (), dest->CreateRequestMessage (floodfill->GetIdentHash ()));	
@@ -464,7 +488,8 @@ namespace data
 		{
 			LogPrint (eLogError, "No floodfills found");
 			dest->Fail ();
-			DeleteRequestedDestination (dest);
+			std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
+			m_RequestedDestinations.erase (destination);
 		}	
 	}	
 	
@@ -475,7 +500,49 @@ namespace data
 		uint32_t replyToken = bufbe32toh (buf + DATABASE_STORE_REPLY_TOKEN_OFFSET);
 		size_t offset = DATABASE_STORE_HEADER_SIZE;
 		if (replyToken)
-			offset += 36;
+		{
+			auto deliveryStatus = CreateDeliveryStatusMsg (replyToken);			
+			uint32_t tunnelID = bufbe32toh (buf + offset);
+			offset += 4;
+			if (!tunnelID) // send response directly
+				transports.SendMessage (buf + offset, deliveryStatus);
+			else
+			{
+				auto pool = i2p::tunnel::tunnels.GetExploratoryPool ();
+				auto outbound = pool ? pool->GetNextOutboundTunnel () : nullptr;
+				if (outbound)
+					outbound->SendTunnelDataMsg (buf + offset, tunnelID, deliveryStatus);
+				else
+				{
+					LogPrint (eLogError, "No outbound tunnels for DatabaseStore reply found");
+					DeleteI2NPMessage (deliveryStatus);
+				}
+			}		
+			offset += 32;
+
+			if (context.IsFloodfill ())
+			{
+				// flood it
+				std::set<IdentHash> excluded;
+				for (int i = 0; i < 3; i++)
+				{
+					auto floodfill = GetClosestFloodfill (buf + DATABASE_STORE_KEY_OFFSET, excluded);
+					if (floodfill)
+					{
+						excluded.insert (floodfill->GetIdentHash ());	
+						auto floodMsg = NewI2NPShortMessage ();
+						uint8_t * payload = floodMsg->GetPayload ();		
+						memcpy (payload, buf, 33); // key + type
+						htobe32buf (payload + DATABASE_STORE_REPLY_TOKEN_OFFSET, 0); // zero reply token
+						memcpy (payload + DATABASE_STORE_HEADER_SIZE, buf + offset, len - offset);
+						floodMsg->len += DATABASE_STORE_HEADER_SIZE + len -offset;
+						FillI2NPMessageHeader (floodMsg, eI2NPDatabaseStore);
+						transports.SendMessage (floodfill->GetIdentHash (), floodMsg);
+					}	
+				}	
+			}	
+		}
+		
 		if (buf[DATABASE_STORE_TYPE_OFFSET]) // type
 		{
 			LogPrint ("LeaseSet");
@@ -485,19 +552,27 @@ namespace data
 		{
 			LogPrint ("RouterInfo");
 			size_t size = bufbe16toh (buf + offset);
-			if (size > 2048)
+			offset += 2;
+			if (size > 2048 || size > len - offset)
 			{
 				LogPrint ("Invalid RouterInfo length ", (int)size);
+				i2p::DeleteI2NPMessage (m);
 				return;
 			}	
-			offset += 2;
-			CryptoPP::Gunzip decompressor;
-			decompressor.Put (buf + offset, size);
-			decompressor.MessageEnd();
-			uint8_t uncompressed[2048];
-			size_t uncomressedSize = decompressor.MaxRetrievable ();
-			decompressor.Get (uncompressed, uncomressedSize);
-			AddRouterInfo (buf + DATABASE_STORE_KEY_OFFSET, uncompressed, uncomressedSize);
+			try
+			{	
+				CryptoPP::Gunzip decompressor;
+				decompressor.Put (buf + offset, size);
+				decompressor.MessageEnd();
+				uint8_t uncompressed[2048];
+				size_t uncomressedSize = decompressor.MaxRetrievable ();
+				decompressor.Get (uncompressed, uncomressedSize);
+				AddRouterInfo (buf + DATABASE_STORE_KEY_OFFSET, uncompressed, uncomressedSize);
+			}
+			catch (CryptoPP::Exception& ex)
+			{
+				LogPrint (eLogError, "DatabaseStore: ", ex.what ());
+			}
 		}	
 		i2p::DeleteI2NPMessage (m);
 	}	
@@ -513,19 +588,19 @@ namespace data
 		auto it = m_RequestedDestinations.find (IdentHash (buf));
 		if (it != m_RequestedDestinations.end ())
 		{	
-			RequestedDestination * dest = it->second;
+			auto& dest = it->second;
 			bool deleteDest = true;
 			if (num > 0)
 			{	
 				auto pool = i2p::tunnel::tunnels.GetExploratoryPool ();
 				auto outbound = pool ? pool->GetNextOutboundTunnel () : nullptr;
 				auto inbound = pool ? pool->GetNextInboundTunnel () : nullptr;
-				std::vector<i2p::tunnel::TunnelMessageBlock> msgs;
 				if (!dest->IsExploratory ())
 				{
 					// reply to our destination. Try other floodfills
 					if (outbound && inbound )
 					{
+						std::vector<i2p::tunnel::TunnelMessageBlock> msgs;
 						auto count = dest->GetExcludedPeers ().size ();
 						if (count < 7)
 						{	
@@ -553,16 +628,16 @@ namespace data
 						}
 						else
 							LogPrint (key, " was not found on 7 floodfills");
+
+						if (msgs.size () > 0)
+							outbound->SendTunnelDataMsg (msgs);	
 					}	
 				}	
 
-				if (outbound && msgs.size () > 0)
-					outbound->SendTunnelDataMsg (msgs);	
 				if (deleteDest)
 				{
 					// no more requests for the destinationation. delete it
 					it->second->Fail ();
-					delete it->second;
 					m_RequestedDestinations.erase (it);
 				}	
 			}
@@ -570,7 +645,6 @@ namespace data
 			{
 				// no more requests for detination possible. delete it
 				it->second->Fail ();
-				delete it->second;
 				m_RequestedDestinations.erase (it);
 			}	
 		}
@@ -606,11 +680,12 @@ namespace data
 		char key[48];
 		int l = i2p::data::ByteStreamToBase64 (buf, 32, key, 48);
 		key[l] = 0;
-		LogPrint ("DatabaseLookup for ", key, " recieved");
 		uint8_t flag = buf[64];
+		LogPrint ("DatabaseLookup for ", key, " recieved flags=", (int)flag);
+		uint8_t lookupType = flag & DATABASE_LOOKUP_TYPE_FLAGS_MASK;
 		uint8_t * excluded = buf + 65;		
 		uint32_t replyTunnelID = 0;
-		if (flag & 0x01) //reply to tunnel
+		if (flag & DATABASE_LOOKUP_DELIVERY_FLAG) //reply to tunnel
 		{
 			replyTunnelID = bufbe32toh (buf + 64);
 			excluded += 4;
@@ -622,10 +697,31 @@ namespace data
 			LogPrint ("Number of excluded peers", numExcluded, " exceeds 512");
 			numExcluded = 0; // TODO:
 		} 
-
+		
 		I2NPMessage * replyMsg = nullptr;
-
+		if (lookupType == DATABASE_LOOKUP_TYPE_EXPLORATORY_LOOKUP)
 		{
+			LogPrint ("Exploratory close to  ", key, " ", numExcluded, " excluded");
+			std::set<IdentHash> excludedRouters;
+			for (int i = 0; i < numExcluded; i++)
+			{
+				excludedRouters.insert (excluded);
+				excluded += 32;
+			}	
+			std::vector<IdentHash> routers;
+			for (int i = 0; i < 3; i++)
+			{
+				auto r = GetClosestNonFloodfill (buf, excludedRouters);
+				if (r)
+				{	
+					routers.push_back (r->GetIdentHash ());
+					excludedRouters.insert (r->GetIdentHash ());
+				}	
+			}	
+			replyMsg = CreateDatabaseSearchReply (buf, routers);
+		}	
+		else
+		{	
 			auto router = FindRouter (buf);
 			if (router)
 			{
@@ -634,37 +730,45 @@ namespace data
 				if (router->GetBuffer ()) 
 					replyMsg = CreateDatabaseStoreMsg (router.get ());
 			}
-		}
-		if (!replyMsg)
-		{
-			auto leaseSet = FindLeaseSet (buf);
-			if (leaseSet) // we don't send back our LeaseSets
+		
+			if (!replyMsg)
 			{
-				LogPrint ("Requested LeaseSet ", key, " found");
-				replyMsg = CreateDatabaseStoreMsg (leaseSet);
+				auto leaseSet = FindLeaseSet (buf);
+				if (leaseSet) // we don't send back our LeaseSets
+				{
+					LogPrint ("Requested LeaseSet ", key, " found");
+					replyMsg = CreateDatabaseStoreMsg (leaseSet.get ());
+				}
+			}
+			if (!replyMsg)
+			{
+				LogPrint ("Requested ", key, " not found. ", numExcluded, " excluded");
+				std::set<IdentHash> excludedRouters;
+				for (int i = 0; i < numExcluded; i++)
+				{
+					excludedRouters.insert (excluded);
+					excluded += 32;
+				}	
+				std::vector<IdentHash> routers;
+				for (int i = 0; i < 3; i++)
+				{
+					auto floodfill = GetClosestFloodfill (buf, excludedRouters);
+					if (floodfill)
+					{	
+						routers.push_back (floodfill->GetIdentHash ());
+						excludedRouters.insert (floodfill->GetIdentHash ());
+					}	
+				}	
+				replyMsg = CreateDatabaseSearchReply (buf, routers);
 			}
 		}
-		if (!replyMsg)
-		{
-			LogPrint ("Requested ", key, " not found. ", numExcluded, " excluded");
-			std::set<IdentHash> excludedRouters;
-			for (int i = 0; i < numExcluded; i++)
-			{
-				// TODO: check for all zeroes (exploratory)
-				excludedRouters.insert (excluded);
-				excluded += 32;
-			}	
-			replyMsg = CreateDatabaseSearchReply (buf, GetClosestFloodfill (buf, excludedRouters).get ());
-		}
-		else
-			excluded += numExcluded*32; // we don't care about exluded	
-
+		
 		if (replyMsg)
 		{	
 			if (replyTunnelID)
 			{
 				// encryption might be used though tunnel only
-				if (flag & 0x02) // encrypted reply requested
+				if (flag & DATABASE_LOOKUP_ENCYPTION_FLAG) // encrypted reply requested
 				{
 					uint8_t * sessionKey = excluded;
 					uint8_t numTags = sessionKey[32];
@@ -704,7 +808,16 @@ namespace data
 		for (int i = 0; i < numDestinations; i++)
 		{	
 			rnd.GenerateBlock (randomHash, 32);
-			RequestedDestination * dest = CreateRequestedDestination (IdentHash (randomHash), true);
+			auto dest = new RequestedDestination (randomHash, true); // exploratory
+			{
+				std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
+				if (!m_RequestedDestinations.insert (std::make_pair (randomHash, 
+					std::unique_ptr<RequestedDestination> (dest))).second) // not inserted
+				{	
+					LogPrint (eLogWarning, "Exploratory destination is requested already");
+					return; 
+				}	
+			}	
 			auto floodfill = GetClosestFloodfill (randomHash, dest->GetExcludedPeers ());
 			if (floodfill && !floodfills.count (floodfill.get ())) // request floodfill only once
 			{	
@@ -728,7 +841,10 @@ namespace data
 					i2p::transport::transports.SendMessage (floodfill->GetIdentHash (), dest->CreateRequestMessage (floodfill->GetIdentHash ()));
 			}	
 			else
-				DeleteRequestedDestination (dest);
+			{
+				std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
+				m_RequestedDestinations.erase (dest->GetDestination ());
+			}	
 		}	
 		if (throughTunnels && msgs.size () > 0)
 			outbound->SendTunnelDataMsg (msgs);		
@@ -737,41 +853,18 @@ namespace data
 	void NetDb::Publish ()
 	{
 		std::set<IdentHash> excluded; // TODO: fill up later
-		for (int i = 0; i < 3; i++)
+		for (int i = 0; i < 2; i++)
 		{	
 			auto floodfill = GetClosestFloodfill (i2p::context.GetRouterInfo ().GetIdentHash (), excluded);
 			if (floodfill)
 			{
-				LogPrint ("Publishing our RouterInfo to ", floodfill->GetIdentHashAbbreviation ());
-				transports.SendMessage (floodfill->GetIdentHash (), CreateDatabaseStoreMsg ());	
+				uint32_t replyToken = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
+				LogPrint ("Publishing our RouterInfo to ", floodfill->GetIdentHashAbbreviation (), ". reply token=", replyToken);
+				transports.SendMessage (floodfill->GetIdentHash (), CreateDatabaseStoreMsg ((RouterInfo *)nullptr, replyToken));	
 				excluded.insert (floodfill->GetIdentHash ());
 			}
 		}	
-	}	
-	
-	RequestedDestination * NetDb::CreateRequestedDestination (const IdentHash& dest, bool isExploratory)
-	{
-		std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
-		auto it = m_RequestedDestinations.find (dest);
-		if (it == m_RequestedDestinations.end ()) // not exist yet
-		{
-			RequestedDestination * d = new RequestedDestination (dest, isExploratory);
-			m_RequestedDestinations[dest] = d;
-			return d;
-		}	
-		else
-			return it->second;
-	}
-
-	void NetDb::DeleteRequestedDestination (RequestedDestination * dest)
-	{
-		if (dest)
-		{
-			std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);
-			m_RequestedDestinations.erase (dest->GetDestination ());
-			delete dest;
-		}	
-	}	
+	}		
 
 	std::shared_ptr<const RouterInfo> NetDb::GetRandomRouter () const
 	{
@@ -792,6 +885,24 @@ namespace data
 			});
 	}	
 
+	std::shared_ptr<const RouterInfo> NetDb::GetRandomPeerTestRouter () const
+	{
+		return GetRandomRouter (
+			[](std::shared_ptr<const RouterInfo> router)->bool 
+			{ 
+				return !router->IsHidden () && router->IsPeerTesting (); 
+			});
+	}
+
+	std::shared_ptr<const RouterInfo> NetDb::GetRandomIntroducer () const
+	{
+		return GetRandomRouter (
+			[](std::shared_ptr<const RouterInfo> router)->bool 
+			{ 
+				return !router->IsHidden () && router->IsIntroducer (); 
+			});
+	}	
+	
 	std::shared_ptr<const RouterInfo> NetDb::GetHighBandwidthRandomRouter (std::shared_ptr<const RouterInfo> compatibleWith) const
 	{
 		return GetRandomRouter (
@@ -855,14 +966,36 @@ namespace data
 		return r;
 	}	
 
+	std::shared_ptr<const RouterInfo> NetDb::GetClosestNonFloodfill (const IdentHash& destination, 
+		const std::set<IdentHash>& excluded) const
+	{
+		std::shared_ptr<const RouterInfo> r;
+		XORMetric minMetric;
+		IdentHash destKey = CreateRoutingKey (destination);
+		minMetric.SetMax ();
+		// must be called from NetDb thread only
+		for (auto it: m_RouterInfos)
+		{	
+			if (!it.second->IsFloodfill () && !excluded.count (it.first))
+			{	
+				XORMetric m = destKey ^ it.first;
+				if (m < minMetric)
+				{
+					minMetric = m;
+					r = it.second;
+				}
+			}	
+		}	
+		return r;
+	}	
+	
 	void NetDb::ManageLeaseSets ()
 	{
 		for (auto it = m_LeaseSets.begin (); it != m_LeaseSets.end ();)
 		{
-			if (it->second->HasNonExpiredLeases ()) // all leases expired
+			if (!it->second->HasNonExpiredLeases ()) // all leases expired
 			{
 				LogPrint ("LeaseSet ", it->second->GetIdentHash ().ToBase64 (), " expired");
-				delete it->second;
 				it = m_LeaseSets.erase (it);
 			}	
 			else 
@@ -873,16 +1006,17 @@ namespace data
 	void NetDb::ManageRequests ()
 	{
 		uint64_t ts = i2p::util::GetSecondsSinceEpoch ();	
+		std::unique_lock<std::mutex> l(m_RequestedDestinationsMutex);	
 		for (auto it = m_RequestedDestinations.begin (); it != m_RequestedDestinations.end ();)
 		{
-			auto dest = it->second;
+			auto& dest = it->second;
 			bool done = false;
-			if (!dest->IsExploratory () && ts < dest->GetCreationTime () + 60) // request is worthless after 1 minute
+			if (ts < dest->GetCreationTime () + 60) // request is worthless after 1 minute
 			{
 				if (ts > dest->GetCreationTime () + 5) // no response for 5 seconds
 				{
 					auto count = dest->GetExcludedPeers ().size ();
-					if (count < 7)
+					if (!dest->IsExploratory () && count < 7)
 					{
 						auto pool = i2p::tunnel::tunnels.GetExploratoryPool ();
 						auto outbound = pool->GetNextOutboundTunnel ();
@@ -901,19 +1035,17 @@ namespace data
 					}	
 					else
 					{
-						LogPrint (eLogWarning, dest->GetDestination ().ToBase64 (), " not found after 7 attempts");	
+						if (!dest->IsExploratory ())
+							LogPrint (eLogWarning, dest->GetDestination ().ToBase64 (), " not found after 7 attempts");	
 						done = true;
 					}	 
 				}	
 			}	
-			else // delete previous exploratory
+			else // delete obsolete request
 				done = true;
 
 			if (done)
-			{
-				delete it->second;
 				it = m_RequestedDestinations.erase (it);
-			}
 			else
 				it++;
 		}	

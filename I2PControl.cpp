@@ -1,11 +1,15 @@
-#include "I2PControl.h"
+// There is bug in boost 1.49 with gcc 4.7 coming with Debian Wheezy
+#define GCC47_BOOST149 ((BOOST_VERSION == 104900) && (__GNUC__ == 4) && (__GNUC_MINOR__ == 7))
 
+#include "I2PControl.h"
 #include <sstream>
 #include <boost/lexical_cast.hpp>
 #include <boost/date_time/local_time/local_time.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/property_tree/ptree.hpp>
+#if !GCC47_BOOST149
 #include <boost/property_tree/json_parser.hpp>
+#endif
 #include "Log.h"
 #include "NetDb.h"
 #include "RouterContext.h"
@@ -31,8 +35,10 @@ namespace client
 		m_MethodHandlers[I2P_CONTROL_METHOD_NETWORK_SETTING] = &I2PControlService::NetworkSettingHandler; 
 
 		// RouterInfo
+		m_RouterInfoHandlers[I2P_CONTROL_ROUTER_INFO_UPTIME] = &I2PControlService::UptimeHandler;
 		m_RouterInfoHandlers[I2P_CONTROL_ROUTER_INFO_NETDB_KNOWNPEERS] = &I2PControlService::NetDbKnownPeersHandler;
 		m_RouterInfoHandlers[I2P_CONTROL_ROUTER_INFO_NETDB_ACTIVEPEERS] = &I2PControlService::NetDbActivePeersHandler;
+		m_RouterInfoHandlers[I2P_CONTROL_ROUTER_INFO_STATUS] = &I2PControlService::StatusHandler;
 		m_RouterInfoHandlers[I2P_CONTROL_ROUTER_INFO_TUNNELS_PARTICIPATING] = &I2PControlService::TunnelsParticipatingHandler;
 
 		// RouterManager	
@@ -111,7 +117,12 @@ namespace client
 	void I2PControlService::ReadRequest (std::shared_ptr<boost::asio::ip::tcp::socket> socket)
 	{
 		auto request = std::make_shared<I2PControlBuffer>();
-		socket->async_read_some (boost::asio::buffer (*request),                
+		socket->async_read_some (
+#if BOOST_VERSION >= 104900
+			boost::asio::buffer (*request),  
+#else
+			boost::asio::buffer (request->data (), request->size ()), 
+#endif              
 			std::bind(&I2PControlService::HandleRequestReceived, this, 
 			std::placeholders::_1, std::placeholders::_2, socket, request));
 	}
@@ -142,8 +153,12 @@ namespace client
 						return; // TODO:
 					}
 				}
+#if GCC47_BOOST149
+				LogPrint (eLogError, "json_read is not supported due bug in boost 1.49 with gcc 4.7");
+#else
 				boost::property_tree::ptree pt;
 				boost::property_tree::read_json (ss, pt);
+
 				std::string method = pt.get<std::string>(I2P_CONTROL_PROPERTY_METHOD);
 				auto it = m_MethodHandlers.find (method);
 				if (it != m_MethodHandlers.end ())
@@ -153,7 +168,19 @@ namespace client
 					{
 						LogPrint (eLogInfo, v.first);
 						if (!v.first.empty())
-							params[v.first] = v.second.data ();
+						{
+							if (v.first == I2P_CONTROL_PARAM_TOKEN)
+							{
+								if (!m_Tokens.count (v.second.data ()))
+								{
+									LogPrint (eLogWarning, "Unknown token ", v.second.data ());
+									return;
+								}
+				
+							}	
+							else
+								params[v.first] = v.second.data ();
+						}	
 					}
 					std::map<std::string, std::string> results;
 					(this->*(it->second))(params, results);
@@ -161,6 +188,7 @@ namespace client
 				}	
 				else
 					LogPrint (eLogWarning, "Unknown I2PControl method ", method);
+#endif
 			}
 			catch (std::exception& ex)
 			{
@@ -187,7 +215,11 @@ namespace client
 		pt.put ("jsonrpc", "2.0");		
 
 		std::ostringstream ss;
+#if GCC47_BOOST149
+		LogPrint (eLogError, "json_write is not supported due bug in boost 1.49 with gcc 4.7");
+#else
 		boost::property_tree::write_json (ss, pt, false);
+#endif
 		size_t len = ss.str ().length (), offset = 0;
 		if (isHtml)
 		{
@@ -229,7 +261,9 @@ namespace client
 		if (password != m_Password)
 			LogPrint (eLogError, "I2PControl Authenticate Invalid password ", password, " expected ", m_Password);
 		results[I2P_CONTROL_PARAM_API] = api;
-		results[I2P_CONTROL_PARAM_TOKEN] = boost::lexical_cast<std::string>(i2p::util::GetSecondsSinceEpoch ());
+		std::string token = boost::lexical_cast<std::string>(i2p::util::GetSecondsSinceEpoch ());
+		m_Tokens.insert (token);	
+		results[I2P_CONTROL_PARAM_TOKEN] = token;
 	}	
 
 	void I2PControlService::EchoHandler (const std::map<std::string, std::string>& params, std::map<std::string, std::string>& results)
@@ -273,6 +307,11 @@ namespace client
 		}
 	}
 
+	void I2PControlService::UptimeHandler (std::map<std::string, std::string>& results)
+	{
+		results[I2P_CONTROL_ROUTER_INFO_UPTIME] = boost::lexical_cast<std::string>(i2p::context.GetUptime ()*1000);	
+	}
+
 	void I2PControlService::NetDbKnownPeersHandler (std::map<std::string, std::string>& results)
 	{
 		results[I2P_CONTROL_ROUTER_INFO_NETDB_KNOWNPEERS] = boost::lexical_cast<std::string>(i2p::data::netdb.GetNumRouters ());	
@@ -283,9 +322,14 @@ namespace client
 		results[I2P_CONTROL_ROUTER_INFO_NETDB_ACTIVEPEERS] = boost::lexical_cast<std::string>(i2p::transport::transports.GetPeers ().size ());	
 	}
 
+	void I2PControlService::StatusHandler (std::map<std::string, std::string>& results)
+	{
+		results[I2P_CONTROL_ROUTER_INFO_STATUS] = boost::lexical_cast<std::string>((int)i2p::context.GetStatus ());
+	}
+
 	void I2PControlService::TunnelsParticipatingHandler (std::map<std::string, std::string>& results)
 	{
-		results[I2P_CONTROL_ROUTER_INFO_TUNNELS_PARTICIPATING] = boost::lexical_cast<std::string>(i2p::tunnel::tunnels.GetTransitTunnels ().size ());;
+		results[I2P_CONTROL_ROUTER_INFO_TUNNELS_PARTICIPATING] = boost::lexical_cast<std::string>(i2p::tunnel::tunnels.GetTransitTunnels ().size ());
 	}
 
 // RouterManager

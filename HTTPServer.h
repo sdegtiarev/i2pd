@@ -69,6 +69,8 @@ namespace util
 			void ShowTransitTunnels (std::stringstream& s);
 			void ShowLocalDestinations (std::stringstream& s);
 			void ShowLocalDestination (const std::string& b32, std::stringstream& s);
+			void ShowSAMSessions (std::stringstream& s);
+			void ShowSAMSession (const std::string& id, std::stringstream& s);
 			void StartAcceptingTunnels (std::stringstream& s);
 			void StopAcceptingTunnels (std::stringstream& s);
 			void FillContent (std::stringstream& s);
@@ -93,7 +95,7 @@ namespace util
 			void SendToAddress (const std::string& address, int port, const char * buf, size_t len);
 			void HandleDestinationRequestTimeout (const boost::system::error_code& ecode, 
 				i2p::data::IdentHash destination, int port, const char * buf, size_t len);
-			void SendToDestination (const i2p::data::LeaseSet * remote, int port, const char * buf, size_t len);
+			void SendToDestination (std::shared_ptr<const i2p::data::LeaseSet> remote, int port, const char * buf, size_t len);
 
 		public:
 

@@ -39,7 +39,7 @@ namespace client
 	const char SAM_DEST_REPLY_I2P_ERROR[] = "DEST REPLY RESULT=I2P_ERROR\n";
 	const char SAM_NAMING_LOOKUP[] = "NAMING LOOKUP";
 	const char SAM_NAMING_REPLY[] = "NAMING REPLY RESULT=OK NAME=ME VALUE=%s\n";
-	const char SAM_DATAGRAM_RECEIVED[] = "DATAGRAM_RECEIVED DESTINATION=%s SIZE=%lu\n";	
+	const char SAM_DATAGRAM_RECEIVED[] = "DATAGRAM RECEIVED DESTINATION=%s SIZE=%lu\n";	
 	const char SAM_NAMING_REPLY_INVALID_KEY[] = "NAMING REPLY RESULT=INVALID_KEY NAME=%s\n";
 	const char SAM_NAMING_REPLY_KEY_NOT_FOUND[] = "NAMING REPLY RESULT=INVALID_KEY_NOT_FOUND NAME=%s\n";
 	const char SAM_PARAM_MIN[] = "MIN";	
@@ -79,6 +79,7 @@ namespace client
 			boost::asio::ip::tcp::socket& GetSocket () { return m_Socket; };
 			void ReceiveHandshake ();
 			void SetSocketType (SAMSocketType socketType) { m_SocketType = socketType; };
+			SAMSocketType GetSocketType () const { return m_SocketType; };
 
 		private:
 
@@ -95,7 +96,7 @@ namespace client
 			void HandleI2PReceive (const boost::system::error_code& ecode, std::size_t bytes_transferred);
 			void HandleI2PAccept (std::shared_ptr<i2p::stream::Stream> stream);
 			void HandleWriteI2PData (const boost::system::error_code& ecode);
-			void HandleI2PDatagramReceive (const i2p::data::IdentityEx& ident, const uint8_t * buf, size_t len);
+			void HandleI2PDatagramReceive (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 
 			void ProcessSessionCreate (char * buf, size_t len);
 			void ProcessStreamConnect (char * buf, size_t len);
@@ -104,10 +105,10 @@ namespace client
 			void ProcessNamingLookup (char * buf, size_t len);
 			void ExtractParams (char * buf, size_t len, std::map<std::string, std::string>& params);
 
-			void Connect (const i2p::data::LeaseSet& remote);
-			void HandleLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident);
-			void SendNamingLookupReply (const i2p::data::LeaseSet * leaseSet);
+			void Connect (std::shared_ptr<const i2p::data::LeaseSet> remote);
+			void HandleConnectLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident);
 			void SendNamingLookupReply (const i2p::data::IdentityEx& identity);
+			void HandleNamingLookupLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident);
 			void HandleSessionReadinessCheckTimer (const boost::system::error_code& ecode);
 			void SendSessionCreateReplyOk ();
 
@@ -127,10 +128,10 @@ namespace client
 
 	struct SAMSession
 	{
-		ClientDestination * localDestination;
+		std::shared_ptr<ClientDestination> localDestination;
 		std::list<std::shared_ptr<SAMSocket> > sockets;
 		
-		SAMSession (ClientDestination * localDestination);		
+		SAMSession (std::shared_ptr<ClientDestination> dest);		
 		~SAMSession ();
 
 		void CloseStreams ();
@@ -150,7 +151,7 @@ namespace client
 			SAMSession * CreateSession (const std::string& id, const std::string& destination, // empty string  means transient
 				const std::map<std::string, std::string> * params);
 			void CloseSession (const std::string& id);
-			SAMSession * FindSession (const std::string& id);
+			SAMSession * FindSession (const std::string& id) const;
 
 		private:
 
@@ -170,9 +171,14 @@ namespace client
 			boost::asio::ip::tcp::acceptor m_Acceptor;
 			boost::asio::ip::udp::endpoint m_DatagramEndpoint, m_SenderEndpoint;
 			boost::asio::ip::udp::socket m_DatagramSocket;
-			std::mutex m_SessionsMutex;
+			mutable std::mutex m_SessionsMutex;
 			std::map<std::string, SAMSession *> m_Sessions;
 			uint8_t m_DatagramReceiveBuffer[i2p::datagram::MAX_DATAGRAM_SIZE+1];
+
+		public:
+
+			// for HTTP
+			const decltype(m_Sessions)& GetSessions () const { return m_Sessions; };
 	};		
 }
 }

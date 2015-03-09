@@ -17,7 +17,7 @@ namespace datagram
 	{
 	}
 
-	void DatagramDestination::SendDatagramTo (const uint8_t * payload, size_t len, const i2p::data::LeaseSet& remote)
+	void DatagramDestination::SendDatagramTo (const uint8_t * payload, size_t len, std::shared_ptr<const i2p::data::LeaseSet> remote)
 	{
 		uint8_t buf[MAX_DATAGRAM_SIZE];
 		auto identityLen = m_Owner.GetIdentity ().ToBuffer (buf, MAX_DATAGRAM_SIZE);
@@ -40,10 +40,10 @@ namespace datagram
 			CreateDataMessage (buf, len + headerLen), remote));
 	}
 
-	void DatagramDestination::SendMsg (I2NPMessage * msg, const i2p::data::LeaseSet& remote)
+	void DatagramDestination::SendMsg (I2NPMessage * msg, std::shared_ptr<const i2p::data::LeaseSet> remote)
 	{
 		auto outboundTunnel = m_Owner.GetTunnelPool ()->GetNextOutboundTunnel ();
-		auto leases = remote.GetNonExpiredLeases ();
+		auto leases = remote->GetNonExpiredLeases ();
 		if (!leases.empty () && outboundTunnel)
 		{
 			std::vector<i2p::tunnel::TunnelMessageBlock> msgs;			
@@ -67,7 +67,7 @@ namespace datagram
 		}	
 	}
 
-	void DatagramDestination::HandleDatagram (const uint8_t * buf, size_t len)
+	void DatagramDestination::HandleDatagram (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len)
 	{
 		i2p::data::IdentityEx identity;
 		size_t identityLen = identity.FromBuffer (buf, len);
@@ -83,7 +83,7 @@ namespace datagram
 		if (verified)
 		{
 			if (m_Receiver != nullptr)
-				m_Receiver (identity, buf + headerLen, len -headerLen);
+				m_Receiver (identity, fromPort, toPort, buf + headerLen, len -headerLen);
 			else
 				LogPrint (eLogWarning, "Receiver for datagram is not set");	
 		}
@@ -91,7 +91,7 @@ namespace datagram
 			LogPrint (eLogWarning, "Datagram signature verification failed");	
 	}
 
-	void DatagramDestination::HandleDataMessagePayload (const uint8_t * buf, size_t len)
+	void DatagramDestination::HandleDataMessagePayload (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len)
 	{
 		// unzip it
 		CryptoPP::Gunzip decompressor;
@@ -102,7 +102,7 @@ namespace datagram
 		if (uncompressedLen <= MAX_DATAGRAM_SIZE)
 		{
 			decompressor.Get (uncompressed, uncompressedLen);
-			HandleDatagram (uncompressed, uncompressedLen); 
+			HandleDatagram (fromPort, toPort, uncompressed, uncompressedLen); 
 		}
 		else
 			LogPrint ("Received datagram size ", uncompressedLen,  " exceeds max size");

@@ -74,10 +74,8 @@ namespace i2p
 			if (host && host[0])
 				i2p::context.UpdateAddress (boost::asio::ip::address::from_string (host));	
 
-			if (i2p::util::config::GetArg("-unreachable", 0))
-				i2p::context.SetUnreachable ();
-
 			i2p::context.SetSupportsV6 (i2p::util::config::GetArg("-v6", 0));
+			i2p::context.SetFloodfill (i2p::util::config::GetArg("-floodfill", 0));
 			
 			LogPrint("CMD parameters:");
 			for (int i = 0; i < argc; ++i)
@@ -127,15 +125,15 @@ namespace i2p
 		{
 			LogPrint("Shutdown started.");
 			i2p::client::context.Stop();
-			LogPrint("Client stoped");
+			LogPrint("Client stopped");
 			i2p::tunnel::tunnels.Stop();
-			LogPrint("Tunnels stoped");
+			LogPrint("Tunnels stopped");
 			i2p::transport::transports.Stop();
-			LogPrint("Transports stoped");
+			LogPrint("Transports stopped");
 			i2p::data::netdb.Stop();
-			LogPrint("NetDB stoped");
+			LogPrint("NetDB stopped");
 			d.httpServer->Stop();
-			LogPrint("HTTP Server stoped");
+			LogPrint("HTTP Server stopped");
 #ifdef USE_UPNP
 			i2p::UPnP::upnpc.Stop();
 #endif

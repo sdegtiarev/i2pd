@@ -12,12 +12,12 @@ namespace i2p
 namespace stream
 {
 	Stream::Stream (boost::asio::io_service& service, StreamingDestination& local, 
-		const i2p::data::LeaseSet& remote, int port): m_Service (service), m_SendStreamID (0), 
-		m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), m_IsOpen (false), 
-		m_IsReset (false), m_IsAckSendScheduled (false), m_LocalDestination (local), 
-		m_RemoteLeaseSet (&remote), m_RoutingSession (nullptr), m_CurrentOutboundTunnel (nullptr),
-		m_ReceiveTimer (m_Service), m_ResendTimer (m_Service), m_AckSendTimer (m_Service), 
-		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (port)
+		std::shared_ptr<const i2p::data::LeaseSet> remote, int port): m_Service (service),
+		m_SendStreamID (0), m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), 
+		m_Status (eStreamStatusNew), m_IsAckSendScheduled (false), m_LocalDestination (local), 
+		m_RemoteLeaseSet (remote), m_ReceiveTimer (m_Service), m_ResendTimer (m_Service), 
+		m_AckSendTimer (m_Service),  m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (port), 
+		m_WindowSize (MIN_WINDOW_SIZE), m_RTT (INITIAL_RTT), m_LastWindowSizeIncreaseTime (0)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 		UpdateCurrentRemoteLease ();
@@ -25,16 +25,22 @@ namespace stream
 
 	Stream::Stream (boost::asio::io_service& service, StreamingDestination& local):
 		m_Service (service), m_SendStreamID (0), m_SequenceNumber (0), m_LastReceivedSequenceNumber (-1), 
-		m_IsOpen (false), m_IsReset (false), m_IsAckSendScheduled (false), m_LocalDestination (local),
-		m_RemoteLeaseSet (nullptr), m_RoutingSession (nullptr), m_CurrentOutboundTunnel (nullptr),
+		m_Status (eStreamStatusNew), m_IsAckSendScheduled (false), m_LocalDestination (local),
 		m_ReceiveTimer (m_Service), m_ResendTimer (m_Service), m_AckSendTimer (m_Service), 
-		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (0)
+		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (0),  m_WindowSize (MIN_WINDOW_SIZE), 
+		m_RTT (INITIAL_RTT), m_LastWindowSizeIncreaseTime (0)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 	}
 
 	Stream::~Stream ()
 	{	
+		Terminate ();
+		LogPrint (eLogDebug, "Stream deleted");
+	}	
+
+	void Stream::Terminate ()
+	{
 		m_AckSendTimer.cancel ();
 		while (!m_ReceiveQueue.empty ())
 		{
@@ -52,7 +58,6 @@ namespace stream
 		for (auto it: m_SavedPackets)
 			delete it;
 		m_SavedPackets.clear ();
-		LogPrint (eLogDebug, "Stream deleted");
 	}	
 		
 	void Stream::HandleNextPacket (Packet * packet)
@@ -95,7 +100,7 @@ namespace stream
 			}
 
 			// schedule ack for last message
-			if (m_IsOpen)
+			if (m_Status == eStreamStatusOpen)
 			{
 				if (!m_IsAckSendScheduled)
 				{
@@ -107,16 +112,14 @@ namespace stream
 			}	
 			else if (isSyn)
 				// we have to send SYN back to incoming connection
-				Send (nullptr, 0); // also sets m_IsOpen				
+				SendBuffer (); // also sets m_IsOpen				
 		}	
 		else 
 		{	
 			if (receivedSeqn <= m_LastReceivedSequenceNumber)
 			{
-				// we have received duplicate. Most likely our outbound tunnel is dead
+				// we have received duplicate
 				LogPrint (eLogWarning, "Duplicate message ", receivedSeqn, " received");
-				m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
-				UpdateCurrentRemoteLease (); // pick another lease
 				SendQuickAck (); // resend ack for previous message again
 				delete packet; // packet dropped
 			}	
@@ -203,14 +206,15 @@ namespace stream
 		if (flags & PACKET_FLAG_CLOSE)
 		{
 			LogPrint (eLogInfo, "Closed");
+			m_Status = eStreamStatusReset;
 			Close ();
-			m_IsOpen = false;
-			m_IsReset = true;
 		}
 	}	
 
 	void Stream::ProcessAck (Packet * packet)
 	{
+		bool acknowledged = false;
+		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
 		uint32_t ackThrough = packet->GetAckThrough ();
 		int nackCount = packet->GetNACKCount ();
 		for (auto it = m_SentPackets.begin (); it != m_SentPackets.end ();)
@@ -230,97 +234,143 @@ namespace stream
 					if (nacked)
 					{
 						LogPrint (eLogDebug, "Packet ", seqn, " NACK");
+						(*it)->numResendAttempts++;
+						(*it)->sendTime = ts;
+						SendPackets (std::vector<Packet *> { *it });
 						it++;
 						continue;
 					}	
 				}
 				auto sentPacket = *it;
-				LogPrint (eLogDebug, "Packet ", seqn, " acknowledged");
+				uint64_t rtt = ts - sentPacket->sendTime;
+				m_RTT = (m_RTT*seqn + rtt)/(seqn + 1);
+				LogPrint (eLogDebug, "Packet ", seqn, " acknowledged rtt=", rtt);
 				m_SentPackets.erase (it++);
 				delete sentPacket;	
+				acknowledged = true;
+				if (m_WindowSize < WINDOW_SIZE)
+					m_WindowSize++; // slow start
+				else
+				{
+					// linear growth
+					if (ts > m_LastWindowSizeIncreaseTime + m_RTT)
+					{
+						m_WindowSize++;
+						if (m_WindowSize > MAX_WINDOW_SIZE) m_WindowSize = MAX_WINDOW_SIZE;
+						m_LastWindowSizeIncreaseTime = ts;
+					}
+				}
 			}
 			else
 				break;
 		}
 		if (m_SentPackets.empty ())
 			m_ResendTimer.cancel ();
+		if (acknowledged)
+			SendBuffer ();
+		if (m_Status == eStreamStatusClosing)
+			Close (); // all outgoing messages have been sent
 	}		
 		
 	size_t Stream::Send (const uint8_t * buf, size_t len)
 	{
-		bool isNoAck = m_LastReceivedSequenceNumber < 0; // first packet
-		std::vector<Packet *> packets;
-		while (!m_IsOpen || len > 0)
+		if (len > 0 && buf)
 		{
-			Packet * p = new Packet ();
-			uint8_t * packet = p->GetBuffer ();
-			// TODO: implement setters
-			size_t size = 0;
-			htobe32buf (packet + size, m_SendStreamID);
-			size += 4; // sendStreamID
-			htobe32buf (packet + size, m_RecvStreamID);
-			size += 4; // receiveStreamID
-			htobe32buf (packet + size, m_SequenceNumber++);
-			size += 4; // sequenceNum
-			if (isNoAck)			
-				htobe32buf (packet + size, m_LastReceivedSequenceNumber);
-			else
-				htobuf32 (packet + size, 0);
-			size += 4; // ack Through
-			packet[size] = 0; 
-			size++; // NACK count
-			packet[size] = RESEND_TIMEOUT;
-			size++; // resend delay
-			if (!m_IsOpen)
-			{	
-				//  initial packet
-				m_IsOpen = true; m_IsReset = false;
-				uint16_t flags = PACKET_FLAG_SYNCHRONIZE | PACKET_FLAG_FROM_INCLUDED | 
-					PACKET_FLAG_SIGNATURE_INCLUDED | PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED;
-				if (isNoAck) flags |= PACKET_FLAG_NO_ACK;
-				htobe16buf (packet + size, flags);
-				size += 2; // flags
-				size_t identityLen = m_LocalDestination.GetOwner ().GetIdentity ().GetFullLen ();
-				size_t signatureLen = m_LocalDestination.GetOwner ().GetIdentity ().GetSignatureLen ();
-				htobe16buf (packet + size, identityLen + signatureLen + 2); // identity + signature + packet size
-				size += 2; // options size
-				m_LocalDestination.GetOwner ().GetIdentity ().ToBuffer (packet + size, identityLen); 
-				size += identityLen; // from
-				htobe16buf (packet + size, STREAMING_MTU);
-				size += 2; // max packet size
-				uint8_t * signature = packet + size; // set it later
-				memset (signature, 0, signatureLen); // zeroes for now
-				size += signatureLen; // signature
-				size_t sentLen = STREAMING_MTU - size;
-				if (len < sentLen) sentLen = len;		
-				memcpy (packet + size, buf, sentLen); 
-				buf += sentLen;
-				len -= sentLen;
-				size += sentLen; // payload
-				m_LocalDestination.GetOwner ().Sign (packet, size, signature);
-			}	
-			else
-			{
-				// follow on packet
-				htobuf16 (packet + size, 0);
-				size += 2; // flags
-				htobuf16 (packet + size, 0); // no options
-				size += 2; // options size
-				size_t sentLen = STREAMING_MTU - size;
-				if (len < sentLen) sentLen = len;		
-				memcpy (packet + size, buf, sentLen); 
-				buf += sentLen;
-				len -= sentLen;
-				size += sentLen; // payload
-			}	
-			p->len = size;
-			packets.push_back (p);
-		}
-		if (packets.size () > 0)
-			m_Service.post (std::bind (&Stream::PostPackets, shared_from_this (), packets));
+			std::unique_lock<std::mutex> l(m_SendBufferMutex);
+			m_SendBuffer.clear ();
+			m_SendBuffer.write ((const char *)buf, len);
+		}	
+		m_Service.post (std::bind (&Stream::SendBuffer, shared_from_this ()));
 		return len;
 	}	
 
+	void Stream::SendBuffer ()
+	{	
+		int numMsgs = m_WindowSize - m_SentPackets.size ();
+		if (numMsgs <= 0) return; // window is full 
+		
+		bool isNoAck = m_LastReceivedSequenceNumber < 0; // first packet
+		std::vector<Packet *> packets;
+		{
+			std::unique_lock<std::mutex> l(m_SendBufferMutex);
+			while ((m_Status == eStreamStatusNew) || (IsEstablished () && !m_SendBuffer.eof () && numMsgs > 0))
+			{
+				Packet * p = new Packet ();
+				uint8_t * packet = p->GetBuffer ();
+				// TODO: implement setters
+				size_t size = 0;
+				htobe32buf (packet + size, m_SendStreamID);
+				size += 4; // sendStreamID
+				htobe32buf (packet + size, m_RecvStreamID);
+				size += 4; // receiveStreamID
+				htobe32buf (packet + size, m_SequenceNumber++);
+				size += 4; // sequenceNum
+				if (isNoAck)			
+					htobe32buf (packet + size, m_LastReceivedSequenceNumber);
+				else
+					htobuf32 (packet + size, 0);
+				size += 4; // ack Through
+				packet[size] = 0; 
+				size++; // NACK count
+				packet[size] = RESEND_TIMEOUT;
+				size++; // resend delay
+				if (m_Status == eStreamStatusNew)
+				{	
+					//  initial packet
+					m_Status = eStreamStatusOpen;
+					uint16_t flags = PACKET_FLAG_SYNCHRONIZE | PACKET_FLAG_FROM_INCLUDED | 
+						PACKET_FLAG_SIGNATURE_INCLUDED | PACKET_FLAG_MAX_PACKET_SIZE_INCLUDED;
+					if (isNoAck) flags |= PACKET_FLAG_NO_ACK;
+					htobe16buf (packet + size, flags);
+					size += 2; // flags
+					size_t identityLen = m_LocalDestination.GetOwner ().GetIdentity ().GetFullLen ();
+					size_t signatureLen = m_LocalDestination.GetOwner ().GetIdentity ().GetSignatureLen ();
+					htobe16buf (packet + size, identityLen + signatureLen + 2); // identity + signature + packet size
+					size += 2; // options size
+					m_LocalDestination.GetOwner ().GetIdentity ().ToBuffer (packet + size, identityLen); 
+					size += identityLen; // from
+					htobe16buf (packet + size, STREAMING_MTU);
+					size += 2; // max packet size
+					uint8_t * signature = packet + size; // set it later
+					memset (signature, 0, signatureLen); // zeroes for now
+					size += signatureLen; // signature
+					m_SendBuffer.read ((char *)(packet + size), STREAMING_MTU - size);
+					size += m_SendBuffer.gcount (); // payload
+					m_LocalDestination.GetOwner ().Sign (packet, size, signature);
+				}	
+				else
+				{
+					// follow on packet
+					htobuf16 (packet + size, 0);
+					size += 2; // flags
+					htobuf16 (packet + size, 0); // no options
+					size += 2; // options size
+					m_SendBuffer.read((char *)(packet + size), STREAMING_MTU - size);  
+					size += m_SendBuffer.gcount (); // payload
+				}	
+				p->len = size;
+				packets.push_back (p);
+				numMsgs--;
+			}
+		}	
+		if (packets.size () > 0)
+		{
+			m_IsAckSendScheduled = false;	
+			m_AckSendTimer.cancel ();
+			bool isEmpty = m_SentPackets.empty ();
+			auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+			for (auto it: packets)
+			{
+				it->sendTime = ts;
+				m_SentPackets.insert (it);
+			}
+			SendPackets (packets);
+			if (m_Status == eStreamStatusClosing && m_SendBuffer.eof ())
+				SendClose ();
+			if (isEmpty)
+				ScheduleResend ();
+		}	
+	}
 		
 	void Stream::SendQuickAck ()
 	{
@@ -356,6 +406,12 @@ namespace stream
 			for (auto it: m_SavedPackets)
 			{
 				auto seqn = it->GetSeqn ();
+				if (numNacks + (seqn - nextSeqn) >= 256)
+				{
+					LogPrint (eLogError, "Number of NACKs exceeds 256. seqn=", seqn, " nextSeqn=", nextSeqn);
+					htobe32buf (packet + 12, nextSeqn); // change ack Through
+					break;
+				}	
 				for (uint32_t i = nextSeqn; i < seqn; i++)
 				{
 					htobe32buf (nacks, i);
@@ -387,41 +443,68 @@ namespace stream
 
 	void Stream::Close ()
 	{
-		if (m_IsOpen)
-		{	
-			m_IsOpen = false;
-			Packet * p = new Packet ();
-			uint8_t * packet = p->GetBuffer ();
-			size_t size = 0;
-			htobe32buf (packet + size, m_SendStreamID);
-			size += 4; // sendStreamID
-			htobe32buf (packet + size, m_RecvStreamID);
-			size += 4; // receiveStreamID
-			htobe32buf (packet + size, m_SequenceNumber++);
-			size += 4; // sequenceNum
-			htobe32buf (packet + size, m_LastReceivedSequenceNumber);
-			size += 4; // ack Through
-			packet[size] = 0; 
-			size++; // NACK count
-			size++; // resend delay
-			htobe16buf (packet + size, PACKET_FLAG_CLOSE | PACKET_FLAG_SIGNATURE_INCLUDED);
-			size += 2; // flags
-			size_t signatureLen = m_LocalDestination.GetOwner ().GetIdentity ().GetSignatureLen ();
-			htobe16buf (packet + size, signatureLen); // signature only
-			size += 2; // options size
-			uint8_t * signature = packet + size;
-			memset (packet + size, 0, signatureLen);
-			size += signatureLen; // signature
-			m_LocalDestination.GetOwner ().Sign (packet, size, signature);
-			
-			p->len = size;
-			m_Service.post (std::bind (&Stream::SendPacket, shared_from_this (), p));
-			LogPrint ("FIN sent");
-			m_ReceiveTimer.cancel ();
-			m_LocalDestination.DeleteStream (shared_from_this ());
-		}	
+		switch (m_Status)
+		{
+			case eStreamStatusOpen:
+				m_Status = eStreamStatusClosing;
+				Close (); // recursion
+				if (m_Status == eStreamStatusClosing) //still closing
+					LogPrint (eLogInfo, "Trying to send stream data before closing");
+			break;
+			case eStreamStatusReset:
+				Terminate ();
+				m_LocalDestination.DeleteStream (shared_from_this ());	
+			break;
+			case eStreamStatusClosing:
+				if (m_SentPackets.empty () && m_SendBuffer.eof ()) // nothing to send
+				{
+					SendClose ();
+					Terminate ();
+					m_LocalDestination.DeleteStream (shared_from_this ());	
+				}
+			break;
+			case eStreamStatusClosed:
+				// already closed
+				Terminate ();
+				m_LocalDestination.DeleteStream (shared_from_this ());		
+			break;				
+			default:
+				LogPrint (eLogWarning, "Unexpected stream status ", (int)m_Status);
+		};			
 	}
 
+	void Stream::SendClose ()
+	{
+		m_Status = eStreamStatusClosed;
+		Packet * p = new Packet ();
+		uint8_t * packet = p->GetBuffer ();
+		size_t size = 0;
+		htobe32buf (packet + size, m_SendStreamID);
+		size += 4; // sendStreamID
+		htobe32buf (packet + size, m_RecvStreamID);
+		size += 4; // receiveStreamID
+		htobe32buf (packet + size, m_SequenceNumber++);
+		size += 4; // sequenceNum
+		htobe32buf (packet + size, m_LastReceivedSequenceNumber);
+		size += 4; // ack Through
+		packet[size] = 0; 
+		size++; // NACK count
+		size++; // resend delay
+		htobe16buf (packet + size, PACKET_FLAG_CLOSE | PACKET_FLAG_SIGNATURE_INCLUDED);
+		size += 2; // flags
+		size_t signatureLen = m_LocalDestination.GetOwner ().GetIdentity ().GetSignatureLen ();
+		htobe16buf (packet + size, signatureLen); // signature only
+		size += 2; // options size
+		uint8_t * signature = packet + size;
+		memset (packet + size, 0, signatureLen);
+		size += signatureLen; // signature
+		m_LocalDestination.GetOwner ().Sign (packet, size, signature);
+		
+		p->len = size;
+		m_Service.post (std::bind (&Stream::SendPacket, shared_from_this (), p));
+		LogPrint ("FIN sent");
+	}	
+		
 	size_t Stream::ConcatenatePackets (uint8_t * buf, size_t len)
 	{
 		size_t pos = 0;
@@ -451,7 +534,7 @@ namespace stream
 				m_AckSendTimer.cancel ();
 			}
 			SendPackets (std::vector<Packet *> { packet });
-			if (m_IsOpen)
+			if (m_Status == eStreamStatusOpen)
 			{	
 				bool isEmpty = m_SentPackets.empty ();
 				m_SentPackets.insert (packet);
@@ -465,30 +548,6 @@ namespace stream
 		else
 			return false;
 	}	
-
-	void Stream::PostPackets (const std::vector<Packet *> packets)
-	{
-		if (m_IsOpen)
-		{	
-			if (packets.size () > 0)
-			{
-				m_IsAckSendScheduled = false;	
-				m_AckSendTimer.cancel ();
-			}
-			bool isEmpty = m_SentPackets.empty ();
-			for (auto it: packets)
-				m_SentPackets.insert (it);
-			SendPackets (packets);
-			if (isEmpty)
-				ScheduleResend ();
-		}
-		else
-		{
-			// delete 
-			for (auto it: packets)
-				delete it;	
-		}	
-	}	
 		
 	void Stream::SendPackets (const std::vector<Packet *>& packets)
 	{
@@ -501,7 +560,8 @@ namespace stream
 				return;
 			}
 		}
-		m_CurrentOutboundTunnel = m_LocalDestination.GetOwner ().GetTunnelPool ()->GetNextOutboundTunnel (m_CurrentOutboundTunnel);
+		if (!m_CurrentOutboundTunnel || !m_CurrentOutboundTunnel->IsEstablished ())
+			m_CurrentOutboundTunnel = m_LocalDestination.GetOwner ().GetTunnelPool ()->GetNextOutboundTunnel ();
 		if (!m_CurrentOutboundTunnel)
 		{
 			LogPrint ("No outbound tunnels in the pool");
@@ -543,25 +603,42 @@ namespace stream
 	{
 		if (ecode != boost::asio::error::operation_aborted)
 		{	
+			auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+			bool congesion = false, first = true;
 			std::vector<Packet *> packets;
 			for (auto it : m_SentPackets)
 			{
 				it->numResendAttempts++;
+				if (first && it->numResendAttempts == 1) // detect congesion at first attempt of first packet only
+					congesion = true;
+				first = false;
 				if (it->numResendAttempts <= MAX_NUM_RESEND_ATTEMPTS)
+				{
+					it->sendTime = ts;
 					packets.push_back (it);
+				}
 				else
 				{
-					LogPrint (eLogWarning, "Packet ", it->GetSeqn (), "was not ACKed after ", MAX_NUM_RESEND_ATTEMPTS,  " attempts. Terminate");
-					m_IsOpen = false;
-					m_IsReset = true;
-					m_ReceiveTimer.cancel ();
+					LogPrint (eLogWarning, "Packet ", it->GetSeqn (), " was not ACKed after ", MAX_NUM_RESEND_ATTEMPTS,  " attempts. Terminate");
+					m_Status = eStreamStatusReset;
+					Close ();
 					return;
 				}	
 			}	
 			if (packets.size () > 0)
 			{
-				m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
-				UpdateCurrentRemoteLease (); // pick another lease
+				if (congesion)
+				{
+					// congesion avoidance
+					m_WindowSize /= 2;
+					if (m_WindowSize < MIN_WINDOW_SIZE) m_WindowSize = MIN_WINDOW_SIZE; 
+				}	
+				else
+				{	
+					// congesion avoidance didn't help
+					m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
+					UpdateCurrentRemoteLease (); // pick another lease
+				}	
 				SendPackets (packets);
 			}	
 			ScheduleResend ();
@@ -572,7 +649,7 @@ namespace stream
 	{
 		if (m_IsAckSendScheduled)
 		{
-			if (m_IsOpen)
+			if (m_Status == eStreamStatusOpen)
 				SendQuickAck ();
 			m_IsAckSendScheduled = false;
 		}	
@@ -589,7 +666,7 @@ namespace stream
 		if (m_RemoteLeaseSet)
 		{
 			if (!m_RoutingSession)
-				m_RoutingSession = m_LocalDestination.GetOwner ().GetRoutingSession (*m_RemoteLeaseSet, 32);
+				m_RoutingSession = m_LocalDestination.GetOwner ().GetRoutingSession (m_RemoteLeaseSet, 32);
 			auto leases = m_RemoteLeaseSet->GetNonExpiredLeases ();
 			if (!leases.empty ())
 			{	
@@ -621,7 +698,7 @@ namespace stream
 		htobe32buf (buf, size); // length
 		buf += 4;
 		compressor.Get (buf, size);
-		htobuf16(buf + 4, 0); // source port
+		htobe16buf (buf + 4, m_LocalDestination.GetLocalPort ()); // source port
 		htobe16buf (buf + 6, m_Port); // destination port 
 		buf[9] = i2p::client::PROTOCOL_TYPE_STREAMING; // streaming protocol
 		msg->len += size + 4; 
@@ -688,7 +765,7 @@ namespace stream
 		}	
 	}	
 
-	std::shared_ptr<Stream> StreamingDestination::CreateNewOutgoingStream (const i2p::data::LeaseSet& remote, int port)
+	std::shared_ptr<Stream> StreamingDestination::CreateNewOutgoingStream (std::shared_ptr<const i2p::data::LeaseSet> remote, int port)
 	{
 		auto s = std::make_shared<Stream> (m_Owner.GetService (), *this, remote, port);
 		std::unique_lock<std::mutex> l(m_StreamsMutex);

@@ -10,11 +10,11 @@ namespace i2p
 namespace client
 {
 	I2PTunnelConnection::I2PTunnelConnection (I2PService * owner, 
-	    boost::asio::ip::tcp::socket * socket, const i2p::data::LeaseSet * leaseSet): 
+	    boost::asio::ip::tcp::socket * socket, std::shared_ptr<const i2p::data::LeaseSet> leaseSet): 
 		I2PServiceHandler(owner), m_Socket (socket), m_RemoteEndpoint (socket->remote_endpoint ()),
 		m_IsQuiet (true)
 	{
-		m_Stream = GetOwner()->GetLocalDestination ()->CreateStream (*leaseSet);
+		m_Stream = GetOwner()->GetLocalDestination ()->CreateStream (leaseSet);
 	}	
 
 	I2PTunnelConnection::I2PTunnelConnection (I2PService * owner,
@@ -202,7 +202,7 @@ namespace client
 		Done(shared_from_this());
 	}
 
-	I2PClientTunnel::I2PClientTunnel (const std::string& destination, int port, ClientDestination * localDestination): 
+	I2PClientTunnel::I2PClientTunnel (const std::string& destination, int port, std::shared_ptr<ClientDestination> localDestination): 
 		TCPIPAcceptor (port,localDestination), m_Destination (destination), m_DestinationIdentHash (nullptr)
 	{}	
 
@@ -243,9 +243,10 @@ namespace client
 			return nullptr;
 	}
 
-	I2PServerTunnel::I2PServerTunnel (const std::string& address, int port, ClientDestination * localDestination): 
+	I2PServerTunnel::I2PServerTunnel (const std::string& address, int port, std::shared_ptr<ClientDestination> localDestination): 
 		I2PService (localDestination), m_Endpoint (boost::asio::ip::address::from_string (address), port)
 	{
+		m_PortDestination = localDestination->CreateStreamingDestination (port);
 	}
 	
 	void I2PServerTunnel::Start ()
@@ -260,9 +261,15 @@ namespace client
 
 	void I2PServerTunnel::Accept ()
 	{
+		if (m_PortDestination)
+			m_PortDestination->SetAcceptor (std::bind (&I2PServerTunnel::HandleAccept, this, std::placeholders::_1));
+
 		auto localDestination = GetLocalDestination ();	
 		if (localDestination)
-			localDestination->AcceptStreams (std::bind (&I2PServerTunnel::HandleAccept, this, std::placeholders::_1));
+		{
+			if (!localDestination->IsAcceptingStreams ()) // set it as default if not set yet
+				localDestination->AcceptStreams (std::bind (&I2PServerTunnel::HandleAccept, this, std::placeholders::_1));
+		}
 		else
 			LogPrint ("Local destination not set for server tunnel");
 	}

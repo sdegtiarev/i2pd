@@ -17,7 +17,7 @@ namespace client
 			const std::map<std::string, std::string> * params):
 		m_IsRunning (false), m_Thread (nullptr), m_Work (m_Service),	
 		m_Keys (keys), m_LeaseSet (nullptr), m_IsPublic (isPublic), m_PublishReplyToken (0),
-		m_DatagramDestination (nullptr), m_PublishConfirmationTimer (m_Service)
+		m_DatagramDestination (nullptr), m_PublishConfirmationTimer (m_Service), m_CleanupTimer (m_Service)
 	{
 		i2p::crypto::GenerateElGamalKeyPair(i2p::context.GetRandomNumberGenerator (), m_EncryptionPrivateKey, m_EncryptionPublicKey);
 		int inboundTunnelLen = DEFAULT_INBOUND_TUNNEL_LENGTH;
@@ -48,7 +48,7 @@ namespace client
 		m_Pool = i2p::tunnel::tunnels.CreateTunnelPool (this, inboundTunnelLen, outboundTunnelLen);  
 		if (m_IsPublic)
 			LogPrint (eLogInfo, "Local address ", i2p::client::GetB32Address(GetIdentHash()), " created");
-		m_StreamingDestination = new i2p::stream::StreamingDestination (*this); // TODO:
+		m_StreamingDestination = std::make_shared<i2p::stream::StreamingDestination> (*this); // TODO:
 	}
 
 	ClientDestination::~ClientDestination ()
@@ -57,12 +57,8 @@ namespace client
 			Stop ();
 		for (auto it: m_LeaseSetRequests)
 			delete it.second;
-		for (auto it: m_RemoteLeaseSets)
-			delete it.second;
 		if (m_Pool)
 			i2p::tunnel::tunnels.DeleteTunnelPool (m_Pool);		
-		if (m_StreamingDestination)
-			delete m_StreamingDestination;
 		if (m_DatagramDestination)
 			delete m_DatagramDestination;
 	}	
@@ -91,6 +87,12 @@ namespace client
 			m_Pool->SetActive (true);
 			m_Thread = new std::thread (std::bind (&ClientDestination::Run, this));
 			m_StreamingDestination->Start ();	
+			for (auto it: m_StreamingDestinationsByPorts)
+				it.second->Start ();
+			
+			m_CleanupTimer.expires_from_now (boost::posix_time::minutes (DESTINATION_CLEANUP_TIMEOUT));
+			m_CleanupTimer.async_wait (std::bind (&ClientDestination::HandleCleanupTimer,
+				this, std::placeholders::_1));
 		}	
 	}
 		
@@ -98,8 +100,11 @@ namespace client
 	{	
 		if (m_IsRunning)
 		{	
+			m_CleanupTimer.cancel ();
 			m_IsRunning = false;
 			m_StreamingDestination->Stop ();	
+			for (auto it: m_StreamingDestinationsByPorts)
+				it.second->Stop ();
 			if (m_DatagramDestination)
 			{
 				auto d = m_DatagramDestination;
@@ -121,7 +126,7 @@ namespace client
 		}	
 	}	
 
-	const i2p::data::LeaseSet * ClientDestination::FindLeaseSet (const i2p::data::IdentHash& ident)
+	std::shared_ptr<const i2p::data::LeaseSet> ClientDestination::FindLeaseSet (const i2p::data::IdentHash& ident)
 	{
 		auto it = m_RemoteLeaseSets.find (ident);
 		if (it != m_RemoteLeaseSets.end ())
@@ -136,7 +141,6 @@ namespace client
 			auto ls = i2p::data::netdb.FindLeaseSet (ident);
 			if (ls)
 			{
-				ls = new i2p::data::LeaseSet (*ls);
 				m_RemoteLeaseSets[ident] = ls;			
 				return ls;
 			}	
@@ -190,7 +194,7 @@ namespace client
 		m_Service.post (std::bind (&ClientDestination::HandleDeliveryStatusMessage, this, msg)); 
 	}
 
-	void ClientDestination::HandleI2NPMessage (const uint8_t * buf, size_t len, i2p::tunnel::InboundTunnel * from)
+	void ClientDestination::HandleI2NPMessage (const uint8_t * buf, size_t len, std::shared_ptr<i2p::tunnel::InboundTunnel> from)
 	{
 		uint8_t typeID = buf[I2NP_HEADER_TYPEID_OFFSET];
 		switch (typeID)
@@ -213,8 +217,11 @@ namespace client
 	{
 		uint32_t replyToken = bufbe32toh (buf + DATABASE_STORE_REPLY_TOKEN_OFFSET);
 		size_t offset = DATABASE_STORE_HEADER_SIZE;
-		if (replyToken) // TODO:
+		if (replyToken) 
+		{
+			LogPrint (eLogInfo, "Reply token is ignored for DatabaseStore");
 			offset += 36;
+		}
 		if (buf[DATABASE_STORE_TYPE_OFFSET] == 1) // LeaseSet
 		{
 			LogPrint (eLogDebug, "Remote LeaseSet");
@@ -227,7 +234,7 @@ namespace client
 			else
 			{	
 				LogPrint (eLogDebug, "New remote LeaseSet added");
-				m_RemoteLeaseSets[buf + DATABASE_STORE_KEY_OFFSET] = new i2p::data::LeaseSet (buf + offset, len - offset);
+				m_RemoteLeaseSets[buf + DATABASE_STORE_KEY_OFFSET] = std::make_shared<i2p::data::LeaseSet> (buf + offset, len - offset);
 			}	
 		}	
 		else
@@ -338,7 +345,7 @@ namespace client
 		m_ExcludedFloodfills.insert (floodfill->GetIdentHash ());
 		LogPrint (eLogDebug, "Publish LeaseSet of ", GetIdentHash ().ToBase32 ());
 		m_PublishReplyToken = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
-		auto msg = WrapMessage (*floodfill, i2p::CreateDatabaseStoreMsg (m_LeaseSet, m_PublishReplyToken));			
+		auto msg = WrapMessage (floodfill, i2p::CreateDatabaseStoreMsg (m_LeaseSet, m_PublishReplyToken));			
 		m_PublishConfirmationTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_CONFIRMATION_TIMEOUT));
 		m_PublishConfirmationTimer.async_wait (std::bind (&ClientDestination::HandlePublishConfirmationTimer,
 			this, std::placeholders::_1));	
@@ -363,19 +370,24 @@ namespace client
 		uint32_t length = bufbe32toh (buf);
 		buf += 4;
 		// we assume I2CP payload
+		uint16_t fromPort = bufbe16toh (buf + 4), // source
+			toPort = bufbe16toh (buf + 6); // destination 
 		switch (buf[9])
 		{
 			case PROTOCOL_TYPE_STREAMING:
+			{
 				// streaming protocol
-				if (m_StreamingDestination)
-					m_StreamingDestination->HandleDataMessagePayload (buf, length);
+				auto dest = GetStreamingDestination (toPort);
+				if (dest)
+					dest->HandleDataMessagePayload (buf, length);
 				else
 					LogPrint ("Missing streaming destination");
+			}
 			break;
 			case PROTOCOL_TYPE_DATAGRAM:
 				// datagram protocol
 				if (m_DatagramDestination)
-					m_DatagramDestination->HandleDataMessagePayload (buf, length);
+					m_DatagramDestination->HandleDataMessagePayload (fromPort, toPort, buf, length);
 				else
 					LogPrint ("Missing streaming destination");
 			break;
@@ -386,9 +398,9 @@ namespace client
 
 	void ClientDestination::CreateStream (StreamRequestComplete streamRequestComplete, const i2p::data::IdentHash& dest, int port) {
 		assert(streamRequestComplete);
-		const i2p::data::LeaseSet * leaseSet = FindLeaseSet (dest);
+		auto leaseSet = FindLeaseSet (dest);
 		if (leaseSet)
-			streamRequestComplete(CreateStream (*leaseSet, port));
+			streamRequestComplete(CreateStream (leaseSet, port));
 		else
 		{
 			RequestDestination (dest,
@@ -398,9 +410,9 @@ namespace client
 						streamRequestComplete (nullptr);
 					else
 					{
-						const i2p::data::LeaseSet * leaseSet = FindLeaseSet (dest);
+						auto leaseSet = FindLeaseSet (dest);
 						if (leaseSet)
-							streamRequestComplete(CreateStream (*leaseSet, port));
+							streamRequestComplete(CreateStream (leaseSet, port));
 						else
 							streamRequestComplete (nullptr);
 					}
@@ -408,7 +420,7 @@ namespace client
 		}
 	}
 
-	std::shared_ptr<i2p::stream::Stream> ClientDestination::CreateStream (const i2p::data::LeaseSet& remote, int port)
+	std::shared_ptr<i2p::stream::Stream> ClientDestination::CreateStream (std::shared_ptr<const i2p::data::LeaseSet> remote, int port)
 	{
 		if (m_StreamingDestination)
 			return m_StreamingDestination->CreateNewOutgoingStream (remote, port);
@@ -416,6 +428,18 @@ namespace client
 			return nullptr;
 	}
 
+	std::shared_ptr<i2p::stream::StreamingDestination> ClientDestination::GetStreamingDestination (int port) const 
+	{ 
+		if (port) 
+		{
+			auto it = m_StreamingDestinationsByPorts.find (port);
+			if (it != m_StreamingDestinationsByPorts.end ())
+				return it->second;
+		}	
+		// if port is zero or not found, use default destination
+		return m_StreamingDestination; 
+	}
+		
 	void ClientDestination::AcceptStreams (const i2p::stream::StreamingDestination::Acceptor& acceptor)
 	{
 		if (m_StreamingDestination)
@@ -427,7 +451,7 @@ namespace client
 		if (m_StreamingDestination)
 			m_StreamingDestination->ResetAcceptor ();
 	}
-
+		
 	bool ClientDestination::IsAcceptingStreams () const
 	{
 		if (m_StreamingDestination)
@@ -435,6 +459,16 @@ namespace client
 		return false;
 	}	
 
+	std::shared_ptr<i2p::stream::StreamingDestination> ClientDestination::CreateStreamingDestination (int port)
+	{
+		auto dest = std::make_shared<i2p::stream::StreamingDestination> (*this, port); 
+		if (port)
+			m_StreamingDestinationsByPorts[port] = dest;
+		else // update default 
+			m_StreamingDestination = dest;
+		return dest;
+	}	
+		
 	i2p::datagram::DatagramDestination * ClientDestination::CreateDatagramDestination ()
 	{
 		if (!m_DatagramDestination)
@@ -505,9 +539,9 @@ namespace client
 			rnd.GenerateBlock (replyTag, 32); // random session tag
 			AddSessionKey (replyKey, replyTag);
 
-			I2NPMessage * msg = WrapMessage (*nextFloodfill,
+			I2NPMessage * msg = WrapMessage (nextFloodfill,
 				CreateLeaseSetDatabaseLookupMsg (dest, request->excluded, 
-					replyTunnel, replyKey, replyTag));
+					replyTunnel.get (), replyKey, replyTag));
 			outboundTunnel->SendTunnelDataMsg (
 				{
 					i2p::tunnel::TunnelMessageBlock 
@@ -538,7 +572,7 @@ namespace client
 				{
 					auto floodfill = i2p::data::netdb.GetClosestFloodfill (dest, it->second->excluded);
 					if (floodfill)
-						 SendLeaseSetRequest (dest, floodfill, it->second);
+						 done = !SendLeaseSetRequest (dest, floodfill, it->second);
 					else
 						done = true;
 				}
@@ -556,6 +590,32 @@ namespace client
 				}	
 			}	
 		}	
+	}
+
+	void ClientDestination::HandleCleanupTimer (const boost::system::error_code& ecode)
+	{
+		if (ecode != boost::asio::error::operation_aborted)
+		{
+			CleanupRoutingSessions ();
+			CleanupRemoteLeaseSets ();
+			m_CleanupTimer.expires_from_now (boost::posix_time::minutes (DESTINATION_CLEANUP_TIMEOUT));
+			m_CleanupTimer.async_wait (std::bind (&ClientDestination::HandleCleanupTimer,
+				this, std::placeholders::_1));
+		}
 	}	
+
+	void ClientDestination::CleanupRemoteLeaseSets ()
+	{
+		for (auto it = m_RemoteLeaseSets.begin (); it != m_RemoteLeaseSets.end ();)
+		{
+			if (!it->second->HasNonExpiredLeases ()) // all leases expired
+			{
+				LogPrint ("Remote LeaseSet ", it->second->GetIdentHash ().ToBase64 (), " expired");
+				it = m_RemoteLeaseSets.erase (it);
+			}	
+			else 
+				it++;
+		}
+	}
 }
 }

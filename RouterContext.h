@@ -17,6 +17,13 @@ namespace i2p
 	const char ROUTER_KEYS[] = "router.keys";	
 	const int ROUTER_INFO_UPDATE_INTERVAL = 1800; // 30 minutes
 	
+	enum RouterStatus
+	{
+		eRouterStatusOK = 0,
+		eRouterStatusTesting = 1,
+		eRouterStatusFirewalled = 2
+	};	
+
 	class RouterContext: public i2p::garlic::GarlicDestination 
 	{
 		public:
@@ -31,13 +38,20 @@ namespace i2p
 					[](const i2p::data::RouterInfo *) {});
 			}
 			CryptoPP::RandomNumberGenerator& GetRandomNumberGenerator () { return m_Rnd; };	
+			uint32_t GetUptime () const;
+			uint32_t GetStartupTime () const { return m_StartupTime; };
+			RouterStatus GetStatus () const { return m_Status; };
+			void SetStatus (RouterStatus status) { m_Status = status; };
 
 			void UpdatePort (int port); // called from Daemon
 			void UpdateAddress (const boost::asio::ip::address& host);	// called from SSU or Daemon
 			bool AddIntroducer (const i2p::data::RouterInfo& routerInfo, uint32_t tag);
 			void RemoveIntroducer (const boost::asio::ip::udp::endpoint& e);
-			bool IsUnreachable () const { return m_IsUnreachable; };
-			void SetUnreachable ();				
+			bool IsUnreachable () const;
+			void SetUnreachable ();		
+			void SetReachable ();
+			bool IsFloodfill () const { return m_IsFloodfill; };	
+			void SetFloodfill (bool floodfill);	
 			bool AcceptsTunnels () const { return m_AcceptsTunnels; };
 			void SetAcceptsTunnels (bool acceptsTunnels) { m_AcceptsTunnels = acceptsTunnels; };
 			bool SupportsV6 () const { return m_RouterInfo.IsV6 (); };
@@ -52,7 +66,7 @@ namespace i2p
 
 			// implements GarlicDestination
 			const i2p::data::LeaseSet * GetLeaseSet () { return nullptr; };
-			void HandleI2NPMessage (const uint8_t * buf, size_t len, i2p::tunnel::InboundTunnel * from);
+			void HandleI2NPMessage (const uint8_t * buf, size_t len, std::shared_ptr<i2p::tunnel::InboundTunnel> from);
 			
 		private:
 
@@ -68,7 +82,9 @@ namespace i2p
 			i2p::data::PrivateKeys m_Keys; 
 			CryptoPP::AutoSeededRandomPool m_Rnd;
 			uint64_t m_LastUpdateTime;
-			bool m_IsUnreachable, m_AcceptsTunnels;
+			bool m_AcceptsTunnels, m_IsFloodfill;
+			uint64_t m_StartupTime; // in seconds since epoch
+			RouterStatus m_Status;
 	};
 
 	extern RouterContext context;

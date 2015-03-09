@@ -7,6 +7,7 @@
 #include <array>
 #include <string>
 #include <map>
+#include <set>
 #include <boost/asio.hpp>
 
 namespace i2p
@@ -44,8 +45,10 @@ namespace client
 	const char I2P_CONTROL_I2PCONTROL_PORT[] = "i2pcontrol.port";		
 
 	// RouterInfo requests
+	const char I2P_CONTROL_ROUTER_INFO_UPTIME[] = "i2p.router.uptime";
 	const char I2P_CONTROL_ROUTER_INFO_NETDB_KNOWNPEERS[] = "i2p.router.netdb.knownpeers";
 	const char I2P_CONTROL_ROUTER_INFO_NETDB_ACTIVEPEERS[] = "i2p.router.netdb.activepeers";
+	const char I2P_CONTROL_ROUTER_INFO_STATUS[] = "i2p.router.net.status";	
 	const char I2P_CONTROL_ROUTER_INFO_TUNNELS_PARTICIPATING[] = "i2p.router.net.tunnels.participating";	
 		
 	// RouterManager requests
@@ -94,8 +97,10 @@ namespace client
 
 			// RouterInfo
 			typedef void (I2PControlService::*RouterInfoRequestHandler)(std::map<std::string, std::string>& results);
+			void UptimeHandler (std::map<std::string, std::string>& results);
 			void NetDbKnownPeersHandler (std::map<std::string, std::string>& results);
-			void NetDbActivePeersHandler (std::map<std::string, std::string>& results);			
+			void NetDbActivePeersHandler (std::map<std::string, std::string>& results);	
+			void StatusHandler (std::map<std::string, std::string>& results);		
 			void TunnelsParticipatingHandler (std::map<std::string, std::string>& results);
 
 			// RouterManager
@@ -116,6 +121,7 @@ namespace client
 			boost::asio::io_service m_Service;
 			boost::asio::ip::tcp::acceptor m_Acceptor;
 			boost::asio::deadline_timer m_ShutdownTimer;
+			std::set<std::string> m_Tokens;
 			
 			std::map<std::string, MethodHandler> m_MethodHandlers;
 			std::map<std::string, I2PControlRequestHandler> m_I2PControlHandlers;

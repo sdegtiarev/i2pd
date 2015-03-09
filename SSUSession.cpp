@@ -15,10 +15,9 @@ namespace transport
 {
 	SSUSession::SSUSession (SSUServer& server, boost::asio::ip::udp::endpoint& remoteEndpoint,
 		std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest ): TransportSession (router), 
-		m_Server (server), m_RemoteEndpoint (remoteEndpoint), 
-		m_Timer (m_Server.GetService ()), m_PeerTest (peerTest),
- 		m_State (eSessionStateUnknown), m_IsSessionKey (false), m_RelayTag (0),
-		m_Data (*this), m_NumSentBytes (0), m_NumReceivedBytes (0)
+		m_Server (server), m_RemoteEndpoint (remoteEndpoint), m_Timer (GetService ()), 
+		m_PeerTest (peerTest),m_State (eSessionStateUnknown), m_IsSessionKey (false), m_RelayTag (0),
+		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Data (*this), m_IsDataReceived (false)
 	{
 		m_CreationTime = i2p::util::GetSecondsSinceEpoch ();
 	}
@@ -26,6 +25,11 @@ namespace transport
 	SSUSession::~SSUSession ()
 	{		
 	}	
+
+	boost::asio::io_service& SSUSession::GetService () 
+	{ 
+		return IsV6 () ? m_Server.GetServiceV6 () : m_Server.GetService (); 
+	}
 	
 	void SSUSession::CreateAESandMacKey (const uint8_t * pubKey)
 	{
@@ -126,7 +130,6 @@ namespace transport
 		switch (header->GetPayloadType ())
 		{
 			case PAYLOAD_TYPE_DATA:
-				LogPrint (eLogDebug, "SSU data received");
 				ProcessData (buf + sizeof (SSUHeader), len - sizeof (SSUHeader));
 			break;
 			case PAYLOAD_TYPE_SESSION_REQUEST:
@@ -220,7 +223,7 @@ namespace transport
 			s.Insert (m_RemoteEndpoint.address ().to_v4 ().to_bytes ().data (), 4); // remote IP v4
 		else
 			s.Insert (m_RemoteEndpoint.address ().to_v6 ().to_bytes ().data (), 16); // remote IP v6
-		s.Insert (htobe16 (m_RemoteEndpoint.port ())); // remote port
+		s.Insert<uint16_t> (htobe16 (m_RemoteEndpoint.port ())); // remote port
 		s.Insert (payload, 8); // relayTag and signed on time 
 		m_RelayTag = bufbe32toh (payload);
 		payload += 4; // relayTag
@@ -255,7 +258,7 @@ namespace transport
 		if (paddingSize > 0) paddingSize = 16 - paddingSize;
 		payload += paddingSize;
 		// TODO: verify signature (need data from session request), payload points to signature
-		SendI2NPMessage (CreateDeliveryStatusMsg (0));
+		m_Data.Send (CreateDeliveryStatusMsg (0));
 		Established ();
 	}
 
@@ -367,7 +370,7 @@ namespace transport
 			s.Insert (address->host.to_v4 ().to_bytes ().data (), 4); // our IP V4
 		else
 			s.Insert (address->host.to_v6 ().to_bytes ().data (), 16); // our IP V6
-		s.Insert (htobe16 (address->port)); // our port
+		s.Insert<uint16_t> (htobe16 (address->port)); // our port
 		uint32_t relayTag = 0;
 		if (i2p::context.GetRouterInfo ().IsIntroducer ())
 		{
@@ -428,7 +431,7 @@ namespace transport
 			s.Insert (m_RemoteEndpoint.address ().to_v4 ().to_bytes ().data (), 4); // remote IP V4
 		else
 			s.Insert (m_RemoteEndpoint.address ().to_v6 ().to_bytes ().data (), 16); // remote IP V6	
-		s.Insert (htobe16 (m_RemoteEndpoint.port ())); // remote port
+		s.Insert<uint16_t> (htobe16 (m_RemoteEndpoint.port ())); // remote port
 		s.Insert (htobe32 (m_RelayTag)); // relay tag
 		s.Insert (htobe32 (signedOnTime)); // signed on time
 		s.Sign (i2p::context.GetPrivateKeys (), payload); // DSA signature	
@@ -755,9 +758,17 @@ namespace transport
 
 	void SSUSession::Close ()
 	{
+		m_State = eSessionStateClosed;
 		SendSesionDestroyed ();
 		transports.PeerDisconnected (shared_from_this ());
+		m_Data.Stop ();
+		m_Timer.cancel ();
 	}	
+
+	void SSUSession::Done ()
+	{
+		GetService ().post (std::bind (&SSUSession::Failed, shared_from_this ()));
+	}
 
 	void SSUSession::Established ()
 	{
@@ -767,7 +778,8 @@ namespace transport
 			delete m_DHKeysPair;
 			m_DHKeysPair = nullptr;
 		}
-		SendI2NPMessage (CreateDatabaseStoreMsg ());
+		m_Data.Start ();
+		m_Data.Send (CreateDatabaseStoreMsg ());
 		transports.PeerConnected (shared_from_this ());
 		if (m_PeerTest && (m_RemoteRouter && m_RemoteRouter->IsPeerTesting ()))
 			SendPeerTest ();
@@ -818,33 +830,53 @@ namespace transport
 
 	void SSUSession::SendI2NPMessage (I2NPMessage * msg)
 	{
-		boost::asio::io_service& service = IsV6 () ? m_Server.GetServiceV6 () : m_Server.GetService ();
-		service.post (std::bind (&SSUSession::PostI2NPMessage, shared_from_this (), msg));    
+		GetService ().post (std::bind (&SSUSession::PostI2NPMessage, shared_from_this (), msg)); 
 	}	
 
 	void SSUSession::PostI2NPMessage (I2NPMessage * msg)
 	{
 		if (msg)
-			m_Data.Send (msg);
+		{
+			if (m_State == eSessionStateEstablished)
+				m_Data.Send (msg);
+			else
+				DeleteI2NPMessage (msg);   
+		}
 	}		
 
 	void SSUSession::SendI2NPMessages (const std::vector<I2NPMessage *>& msgs)
 	{
-		boost::asio::io_service& service = IsV6 () ? m_Server.GetServiceV6 () : m_Server.GetService ();
-		service.post (std::bind (&SSUSession::PostI2NPMessages, shared_from_this (), msgs));    
+		GetService ().post (std::bind (&SSUSession::PostI2NPMessages, shared_from_this (), msgs));    
 	}
 
 	void SSUSession::PostI2NPMessages (std::vector<I2NPMessage *> msgs)
 	{
-		for (auto it: msgs)
-			if (it) m_Data.Send (it);
+		if (m_State == eSessionStateEstablished)
+		{
+			for (auto it: msgs)
+				if (it) m_Data.Send (it);
+		}
+		else
+		{
+			for (auto it: msgs)
+				DeleteI2NPMessage (it);
+		}
 	}	
 
 	void SSUSession::ProcessData (uint8_t * buf, size_t len)
 	{
 		m_Data.ProcessMessage (buf, len);
+		m_IsDataReceived = true;
 	}
 
+	void SSUSession::FlushData ()
+	{
+		if (m_IsDataReceived)
+		{	
+			m_Data.FlushReceivedMessage ();
+			m_IsDataReceived = false;
+		}		
+	}
 
 	void SSUSession::ProcessPeerTest (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint)
 	{
@@ -864,65 +896,101 @@ namespace transport
 			LogPrint (eLogWarning, "Address of ", size, " bytes not supported");	
 			return;
 		}	
-		if (m_PeerTestNonces.count (nonce) > 0)
-		{
-			// existing test
-			if (m_PeerTest)
+		switch (m_Server.GetPeerTestParticipant (nonce))
+		{	
+			// existing test 
+			case ePeerTestParticipantAlice1:
+			{			
+				if (m_State == eSessionStateEstablished)
+				{
+					LogPrint (eLogDebug, "SSU peer test from Bob. We are Alice");
+					if (i2p::context.GetStatus () == eRouterStatusTesting) // still not OK
+						i2p::context.SetStatus (eRouterStatusFirewalled);
+				}
+				else
+				{
+					LogPrint (eLogDebug, "SSU first peer test from Charlie. We are Alice");
+					i2p::context.SetStatus (eRouterStatusOK);
+					m_Server.UpdatePeerTest (nonce, ePeerTestParticipantAlice2);
+					SendPeerTest (nonce, senderEndpoint.address ().to_v4 ().to_ulong (), 
+						senderEndpoint.port (), introKey, true, false); // to Charlie
+				}
+				break;
+			}	
+			case ePeerTestParticipantAlice2:
 			{
-				LogPrint (eLogDebug, "SSU peer test from Bob. We are Alice");
-				m_PeerTestNonces.erase (nonce);
-				m_PeerTest = false;
-			}
-			else if (port)
+				if (m_State == eSessionStateEstablished)
+					LogPrint (eLogDebug, "SSU peer test from Bob. We are Alice");
+				else
+				{
+					// peer test successive
+					LogPrint (eLogDebug, "SSU second peer test from Charlie. We are Alice");
+					i2p::context.SetStatus (eRouterStatusOK);
+					m_Server.RemovePeerTest (nonce);
+				}
+				break;
+			}	
+			case ePeerTestParticipantBob: 
 			{
 				LogPrint (eLogDebug, "SSU peer test from Charlie. We are Bob");
+				m_Server.RemovePeerTest (nonce); // nonce has been used
 				boost::asio::ip::udp::endpoint ep (boost::asio::ip::address_v4 (be32toh (address)), be16toh (port)); // Alice's address/port
 				auto session = m_Server.FindSession (ep); // find session with Alice
 				if (session)
 					session->Send (PAYLOAD_TYPE_PEER_TEST, buf1, len); // back to Alice
+				break;
 			}
-			else
-			{
+			case ePeerTestParticipantCharlie:
+			{	
 				LogPrint (eLogDebug, "SSU peer test from Alice. We are Charlie");
+				m_Server.RemovePeerTest (nonce); // nonce has been used
 				SendPeerTest (nonce, senderEndpoint.address ().to_v4 ().to_ulong (),
-						senderEndpoint.port (), introKey); // to Alice
+					senderEndpoint.port (), introKey); // to Alice with her actual address
+				break;
 			}
-		}
-		else
-		{
-			if (m_State == eSessionStateEstablished)
+			// test not found	
+			case ePeerTestParticipantUnknown:
 			{
-				// new test
-				m_PeerTestNonces.insert (nonce);
-				if (port)
+				if (m_State == eSessionStateEstablished)
 				{
-					LogPrint (eLogDebug, "SSU peer test from Bob. We are Charlie");
-					Send (PAYLOAD_TYPE_PEER_TEST, buf1, len); // back to Bob
-					SendPeerTest (nonce, be32toh (address), be16toh (port), introKey); // to Alice
+					// new test
+					if (port)
+					{
+						LogPrint (eLogDebug, "SSU peer test from Bob. We are Charlie");
+						m_Server.NewPeerTest (nonce, ePeerTestParticipantCharlie);
+						Send (PAYLOAD_TYPE_PEER_TEST, buf1, len); // back to Bob
+						SendPeerTest (nonce, be32toh (address), be16toh (port), introKey); // to Alice with her address received from Bob
+					}
+					else
+					{
+						LogPrint (eLogDebug, "SSU peer test from Alice. We are Bob");
+						auto session = m_Server.GetRandomEstablishedSession (shared_from_this ()); // Charlie
+						if (session)
+						{
+							m_Server.NewPeerTest (nonce, ePeerTestParticipantBob);
+							session->SendPeerTest (nonce, senderEndpoint.address ().to_v4 ().to_ulong (),
+								senderEndpoint.port (), introKey, false); // to Charlie with Alice's actual address 	
+						}	
+					}
 				}
 				else
-				{
-					LogPrint (eLogDebug, "SSU peer test from Alice. We are Bob");
-					auto session = m_Server.GetRandomEstablishedSession (shared_from_this ()); // charlie
-					if (session)
-						session->SendPeerTest (nonce, senderEndpoint.address ().to_v4 ().to_ulong (),
-							senderEndpoint.port (), introKey, false); 		
-				}
+					LogPrint (eLogError, "SSU unexpected peer test");	
 			}
-			else
-				LogPrint (eLogDebug, "SSU peer test from Charlie. We are Alice");
 		}	
 	}
 	
 	void SSUSession::SendPeerTest (uint32_t nonce, uint32_t address, uint16_t port, 
-		const uint8_t * introKey, bool toAddress)
+		const uint8_t * introKey, bool toAddress, bool sendAddress)
+	// toAddress is true for Alice<->Chalie communications only
+	// sendAddress is false if message comes from Alice		
 	{
 		uint8_t buf[80 + 18];
 		uint8_t iv[16];
 		uint8_t * payload = buf + sizeof (SSUHeader);
 		htobe32buf (payload, nonce);
 		payload += 4; // nonce	
-		if (address)
+		// address and port
+		if (sendAddress && address)
 		{					
 			*payload = 4;
 			payload++; // size
@@ -936,8 +1004,20 @@ namespace transport
 		}
 		htobe16buf (payload, port);
 		payload += 2; // port
-		memcpy (payload, introKey, 32); // intro key
+		// intro key
+		if (toAddress)
+		{
+			// send our intro key to address instead it's own
+			auto addr = i2p::context.GetRouterInfo ().GetSSUAddress ();
+			if (addr)
+				memcpy (payload, addr->key, 32); // intro key
+			else
+				LogPrint (eLogError, "SSU is not supported. Can't send peer test");	
+		}	
+		else	
+			memcpy (payload, introKey, 32); // intro key
 
+		// send	
 		CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
 		rnd.GenerateBlock (iv, 16); // random iv
 		if (toAddress)
@@ -957,6 +1037,7 @@ namespace transport
 
 	void SSUSession::SendPeerTest ()
 	{
+		// we are Alice
 		LogPrint (eLogDebug, "SSU sending peer test");
 		auto address = i2p::context.GetRouterInfo ().GetSSUAddress ();
 		if (!address)
@@ -966,8 +1047,9 @@ namespace transport
 		}
 		uint32_t nonce = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 		if (!nonce) nonce = 1;
-		m_PeerTestNonces.insert (nonce);
-		SendPeerTest (nonce, 0, 0, address->key, false); // address and port always zero for Alice
+		m_PeerTest = false;
+		m_Server.NewPeerTest (nonce, ePeerTestParticipantAlice1);
+		SendPeerTest (nonce, 0, 0, address->key, false, false); // address and port always zero for Alice
 	}	
 
 	void SSUSession::SendKeepAlive ()
@@ -994,7 +1076,14 @@ namespace transport
 			uint8_t buf[48 + 18];
 			// encrypt message with session key
 			FillHeaderAndEncrypt (PAYLOAD_TYPE_SESSION_DESTROYED, buf, 48);
-			Send (buf, 48);
+			try
+			{
+				Send (buf, 48);
+			}
+			catch (std::exception& ex)
+			{
+				LogPrint (eLogError, "SSU send session destoriyed exception ", ex.what ()); 
+			}
 			LogPrint (eLogDebug, "SSU session destroyed sent");
 		}
 	}	

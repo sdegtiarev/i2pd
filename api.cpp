@@ -39,11 +39,11 @@ namespace api
 	{
 		LogPrint("Shutdown started.");
 		i2p::tunnel::tunnels.Stop();
-		LogPrint("Tunnels stoped");
+		LogPrint("Tunnels stopped");
 		i2p::transport::transports.Stop();
-		LogPrint("Transports stoped");
+		LogPrint("Transports stopped");
 		i2p::data::netdb.Stop();
-		LogPrint("NetDB stoped");
+		LogPrint("NetDB stopped");
 		StopLog ();
 	}
 
@@ -85,7 +85,7 @@ namespace api
 		auto leaseSet = dest->FindLeaseSet (remote);
 		if (leaseSet)
 		{
-			auto stream = dest->CreateStream (*leaseSet);
+			auto stream = dest->CreateStream (leaseSet);
 			stream->Send (nullptr, 0); // connect
 			return stream;
 		}

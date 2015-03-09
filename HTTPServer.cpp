@@ -1,5 +1,6 @@
 #include <boost/bind.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
 #include "base64.h"
 #include "Log.h"
 #include "Tunnel.h"
@@ -469,6 +470,9 @@ namespace util
 	const char HTTP_COMMAND_LOCAL_DESTINATIONS[] = "local_destinations";
 	const char HTTP_COMMAND_LOCAL_DESTINATION[] = "local_destination";
 	const char HTTP_PARAM_BASE32_ADDRESS[] = "b32";
+	const char HTTP_COMMAND_SAM_SESSIONS[] = "sam_sessions";
+	const char HTTP_COMMAND_SAM_SESSION[] = "sam_session";
+	const char HTTP_PARAM_SAM_SESSION_ID[] = "id";
 	
 	namespace misc_strings
 	{
@@ -605,7 +609,8 @@ namespace util
 	{
 		if (ecode != boost::asio::error::operation_aborted)
 		{
-			m_Socket->close ();
+			boost::system::error_code ignored_ec;
+			m_Socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored_ec);
 			Terminate ();
 		}	
 	}
@@ -641,9 +646,22 @@ namespace util
 
 	void HTTPConnection::FillContent (std::stringstream& s)
 	{
-		s << "<h2>Welcome to the Webconsole!</h2><br><br>";
-		s << "<b>Data path:</b> " << i2p::util::filesystem::GetDataDir().string() << "<br>" << "<br>";
-		s << "<b>Our external address:</b>" << "<br>";
+		s << "<h2>Welcome to the Webconsole!</h2><br>";
+		s << "<b>Uptime:</b> " << boost::posix_time::to_simple_string (
+			boost::posix_time::time_duration (boost::posix_time::seconds (
+			i2p::context.GetUptime ()))) << "<br>";
+		s << "<b>Status:</b> ";
+		switch (i2p::context.GetStatus ())
+		{
+			case eRouterStatusOK: s << "OK"; break;
+			case eRouterStatusTesting: s << "Testing"; break;
+			case eRouterStatusFirewalled: s << "Firewalled"; break; 
+			default: s << "Unknown";
+		} 
+		s << "<br>";
+		s << "<b>Tunnel creation success rate:</b> " << i2p::tunnel::tunnels.GetTunnelCreationSuccessRate () << "%<br>";
+		s << "<b>Data path:</b> " << i2p::util::filesystem::GetDataDir().string() << "<br><br>";
+		s << "<b>Our external address:</b>" << "<br>" ;
 		for (auto& address : i2p::context.GetRouterInfo().GetAddresses())
 		{
 			switch (address.transportStyle)
@@ -672,7 +690,10 @@ namespace util
 		s << "<br><b><a href=/?" << HTTP_COMMAND_LOCAL_DESTINATIONS << ">Local destinations</a></b>";
 		s << "<br><b><a href=/?" << HTTP_COMMAND_TUNNELS << ">Tunnels</a></b>";
 		s << "<br><b><a href=/?" << HTTP_COMMAND_TRANSIT_TUNNELS << ">Transit tunnels</a></b>";
-		s << "<br><b><a href=/?" << HTTP_COMMAND_TRANSPORTS << ">Transports</a></b><br>";
+		s << "<br><b><a href=/?" << HTTP_COMMAND_TRANSPORTS << ">Transports</a></b>";
+		if (i2p::client::context.GetSAMBridge ())
+			s << "<br><b><a href=/?" << HTTP_COMMAND_SAM_SESSIONS << ">SAM sessions</a></b>";
+		s << "<br>";
 		
 		if (i2p::context.AcceptsTunnels ())
 			s << "<br><b><a href=/?" << HTTP_COMMAND_STOP_ACCEPTING_TUNNELS << ">Stop accepting tunnels</a></b><br>";
@@ -704,6 +725,15 @@ namespace util
 			ExtractParams (command.substr (paramsPos), params);
 			auto b32 = params[HTTP_PARAM_BASE32_ADDRESS];
 			ShowLocalDestination (b32, s);
+		}	
+		else if (cmd == HTTP_COMMAND_SAM_SESSIONS)
+			ShowSAMSessions (s);
+		else if (cmd == HTTP_COMMAND_SAM_SESSION)
+		{
+			std::map<std::string, std::string> params;
+			ExtractParams (command.substr (paramsPos), params);
+			auto id = params[HTTP_PARAM_SAM_SESSION_ID];
+			ShowSAMSession (id, s);
 		}	
 	}	
 
@@ -742,6 +772,8 @@ namespace util
 				s << endpoint.address ().to_string () << ":" << endpoint.port ();
 				if (!outgoing) s << "-->";
 				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
+				if (it.second->GetRelayTag ())
+					s << " [itag:" << it.second->GetRelayTag () << "]";
 				s << "<br>";
 				s << std::endl;
 			}
@@ -750,6 +782,8 @@ namespace util
 	
 	void HTTPConnection::ShowTunnels (std::stringstream& s)
 	{
+		s << "Queue size:" << i2p::tunnel::tunnels.GetQueueSize () << "<br>";
+
 		for (auto it: i2p::tunnel::tunnels.GetOutboundTunnels ())
 		{
 			it->GetTunnelConfig ()->Print (s);
@@ -807,6 +841,7 @@ namespace util
 		auto dest = i2p::client::context.FindLocalDestination (ident);
 		if (dest)
 		{
+			s << "<b>Base64:</b><br>" << dest->GetIdentity ().ToBase64 () << "<br><br>";
 			s << "<b>LeaseSets:</b> <i>" << dest->GetNumRemoteLeaseSets () << "</i><br>";
 			auto pool = dest->GetTunnelPool ();
 			if (pool)
@@ -839,8 +874,55 @@ namespace util
 				s << it.first << "->" << i2p::client::context.GetAddressBook ().ToAddress(it.second->GetRemoteIdentity ()) << " ";
 				s << " [" << it.second->GetNumSentBytes () << ":" << it.second->GetNumReceivedBytes () << "]";
 				s << " [out:" << it.second->GetSendQueueSize () << "][in:" << it.second->GetReceiveQueueSize () << "]";
+				s << "[buf:" << it.second->GetSendBufferSize () << "]";
+				s << "[RTT:" << it.second->GetRTT () << "]"; 
 				s << "<br>"<< std::endl; 
 			}	
+		}	
+	}	
+
+	void HTTPConnection::ShowSAMSessions (std::stringstream& s)
+	{
+		auto sam = i2p::client::context.GetSAMBridge ();
+		if (sam)
+		{	
+			for (auto& it: sam->GetSessions ())
+			{
+				s << "<a href=/?" << HTTP_COMMAND_SAM_SESSION;
+				s << "&" << HTTP_PARAM_SAM_SESSION_ID << "=" << it.first << ">";
+				s << it.first << "</a><br>" << std::endl;
+			}	
+		}	
+	}	
+
+	void HTTPConnection::ShowSAMSession (const std::string& id, std::stringstream& s)
+	{
+		auto sam = i2p::client::context.GetSAMBridge ();
+		if (sam)
+		{
+			auto session = sam->FindSession (id);
+			if (session)
+			{
+				for (auto it: session->sockets)
+				{
+					switch (it->GetSocketType ())
+					{
+						case i2p::client::eSAMSocketTypeSession:
+							s << "session";
+						break;	
+						case i2p::client::eSAMSocketTypeStream:
+							s << "stream";
+						break;	
+						case i2p::client::eSAMSocketTypeAcceptor:
+							s << "acceptor";
+						break;
+						default:
+							s << "unknown";
+					}
+					s << " [" << it->GetSocket ().remote_endpoint() << "]";
+					s << "<br>" << std::endl;
+				}	
+			}
 		}	
 	}	
 	
@@ -901,10 +983,10 @@ namespace util
 		}
 	}	
 	
-	void HTTPConnection::SendToDestination (const i2p::data::LeaseSet * remote, int port, const char * buf, size_t len)
+	void HTTPConnection::SendToDestination (std::shared_ptr<const i2p::data::LeaseSet> remote, int port, const char * buf, size_t len)
 	{
 		if (!m_Stream)
-			m_Stream = i2p::client::context.GetSharedLocalDestination ()->CreateStream (*remote, port);
+			m_Stream = i2p::client::context.GetSharedLocalDestination ()->CreateStream (remote, port);
 		if (m_Stream)
 		{
 			m_Stream->Send ((uint8_t *)buf, len);

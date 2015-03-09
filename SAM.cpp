@@ -148,7 +148,7 @@ namespace client
 
 	void SAMSocket::SendMessageReply (const char * msg, size_t len, bool close)
 	{
-		if (!m_IsSilent || m_SocketType == eSAMSocketTypeAcceptor) 
+		if (!m_IsSilent) 
 			boost::asio::async_write (m_Socket, boost::asio::buffer (msg, len), boost::asio::transfer_all (),
 				std::bind(&SAMSocket::HandleMessageReplySent, shared_from_this (), 
 				std::placeholders::_1, std::placeholders::_2, close));
@@ -259,7 +259,7 @@ namespace client
 				{
 					auto dest = m_Session->localDestination->CreateDatagramDestination ();
 					dest->SetReceiver (std::bind (&SAMSocket::HandleI2PDatagramReceive, shared_from_this (), 
-						std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+						std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5));
 				}
 				SendSessionCreateReplyOk ();
 			}
@@ -320,13 +320,13 @@ namespace client
 			i2p::data::IdentityEx dest;
 			dest.FromBase64 (destination);
 			context.GetAddressBook ().InsertAddress (dest);
-			auto leaseSet = i2p::data::netdb.FindLeaseSet (dest.GetIdentHash ());
+			auto leaseSet = m_Session->localDestination->FindLeaseSet (dest.GetIdentHash ());
 			if (leaseSet)
-				Connect (*leaseSet);
+				Connect (leaseSet);
 			else
 			{
 				m_Session->localDestination->RequestDestination (dest.GetIdentHash (), 
-					std::bind (&SAMSocket::HandleLeaseSetRequestComplete,
+					std::bind (&SAMSocket::HandleConnectLeaseSetRequestComplete,
 					shared_from_this (), std::placeholders::_1, dest.GetIdentHash ()));	
 			}
 		}
@@ -334,7 +334,7 @@ namespace client
 			SendMessageReply (SAM_STREAM_STATUS_INVALID_ID, strlen(SAM_STREAM_STATUS_INVALID_ID), true);		
 	}
 
-	void SAMSocket::Connect (const i2p::data::LeaseSet& remote)
+	void SAMSocket::Connect (std::shared_ptr<const i2p::data::LeaseSet> remote)
 	{
 		m_SocketType = eSAMSocketTypeStream;
 		m_Session->sockets.push_back (shared_from_this ());
@@ -344,13 +344,13 @@ namespace client
 		SendMessageReply (SAM_STREAM_STATUS_OK, strlen(SAM_STREAM_STATUS_OK), false);
 	}
 
-	void SAMSocket::HandleLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident)
+	void SAMSocket::HandleConnectLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident)
 	{
-		const i2p::data::LeaseSet * leaseSet =  nullptr;
-		if (success) // timeout expired
+		std::shared_ptr<const i2p::data::LeaseSet> leaseSet;
+		if (success) 
 			leaseSet = m_Session->localDestination->FindLeaseSet (ident);
 		if (leaseSet)
-			Connect (*leaseSet);
+			Connect (leaseSet);
 		else
 		{
 			LogPrint ("SAM destination to connect not found");
@@ -409,14 +409,26 @@ namespace client
 		std::map<std::string, std::string> params;
 		ExtractParams (buf, len, params);
 		std::string& name = params[SAM_PARAM_NAME];
-		i2p::data::IdentHash ident;
 		i2p::data::IdentityEx identity;
+		i2p::data::IdentHash ident;
 		if (name == "ME")
-			SendNamingLookupReply (nullptr);
+			SendNamingLookupReply (m_Session->localDestination->GetIdentity ());
 		else if (context.GetAddressBook ().GetAddress (name, identity))
 			SendNamingLookupReply (identity);
+		else if (m_Session && m_Session->localDestination &&
+			context.GetAddressBook ().GetIdentHash (name, ident))
+		{
+			auto leaseSet = m_Session->localDestination->FindLeaseSet (ident);
+			if (leaseSet)
+				SendNamingLookupReply (leaseSet->GetIdentity ());
+			else
+				m_Session->localDestination->RequestDestination (ident, 
+					std::bind (&SAMSocket::HandleNamingLookupLeaseSetRequestComplete,
+					shared_from_this (), std::placeholders::_1, ident));	
+		}	
 		else 
 		{
+			LogPrint ("SAM naming failed. Unknown address ", name);
 #ifdef _MSC_VER
 			size_t len = sprintf_s (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_NAMING_REPLY_INVALID_KEY, name.c_str());
 #else				
@@ -426,15 +438,30 @@ namespace client
 		}
 	}	
 
-	void SAMSocket::SendNamingLookupReply (const i2p::data::LeaseSet * leaseSet)
+	void  SAMSocket::HandleNamingLookupLeaseSetRequestComplete (bool success, i2p::data::IdentHash ident)
 	{
-		const i2p::data::IdentityEx& identity = leaseSet ? leaseSet->GetIdentity () : m_Session->localDestination->GetIdentity ();
+		std::shared_ptr<const i2p::data::LeaseSet> leaseSet;
+		if (success) 
+			leaseSet = m_Session->localDestination->FindLeaseSet (ident);
 		if (leaseSet)
-			// we found LeaseSet for our address, store it to addressbook
-			context.GetAddressBook ().InsertAddress (identity);
-		SendNamingLookupReply (identity);
-	}
-
+		{	
+			context.GetAddressBook ().InsertAddress (leaseSet->GetIdentity ());
+			SendNamingLookupReply (leaseSet->GetIdentity ());
+		}	
+		else
+		{
+			LogPrint (eLogInfo, "SAM naming lookup failed. LeaseSet for ", ident.ToBase32 (), " not found");
+#ifdef _MSC_VER
+			size_t len = sprintf_s (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_NAMING_REPLY_INVALID_KEY, 
+				context.GetAddressBook ().ToAddress (ident).c_str());
+#else				
+			size_t len = snprintf (m_Buffer, SAM_SOCKET_BUFFER_SIZE, SAM_NAMING_REPLY_INVALID_KEY,
+				context.GetAddressBook ().ToAddress (ident).c_str());
+#endif
+			SendMessageReply (m_Buffer, len, false);
+		}
+	}	
+		
 	void SAMSocket::SendNamingLookupReply (const i2p::data::IdentityEx& identity)
 	{
 		auto base64 = identity.ToBase64 ();
@@ -539,17 +566,20 @@ namespace client
 				// send remote peer address
 				uint8_t ident[1024];
 				size_t l = stream->GetRemoteIdentity ().ToBuffer (ident, 1024);
-				size_t l1 = i2p::data::ByteStreamToBase64 (ident, l, m_Buffer, SAM_SOCKET_BUFFER_SIZE);
-				m_Buffer[l1] = '\n';
-				SendMessageReply (m_Buffer, l1 + 1, false);
+				size_t l1 = i2p::data::ByteStreamToBase64 (ident, l, (char *)m_StreamBuffer, SAM_SOCKET_BUFFER_SIZE);
+				m_StreamBuffer[l1] = '\n';
+				HandleI2PReceive (boost::system::error_code (), l1 +1); // we send identity like it has been received from stream
 			}	
-			I2PReceive ();
+			else
+				I2PReceive ();
 		}
+		else
+			LogPrint (eLogInfo, "SAM I2P acceptor has been reset");
 	}	
 
-	void SAMSocket::HandleI2PDatagramReceive (const i2p::data::IdentityEx& ident, const uint8_t * buf, size_t len)
+	void SAMSocket::HandleI2PDatagramReceive (const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len)
 	{
-		auto base64 = ident.ToBase64 ();
+		auto base64 = from.ToBase64 ();
 #ifdef _MSC_VER
 		size_t l = sprintf_s ((char *)m_StreamBuffer, SAM_SOCKET_BUFFER_SIZE, SAM_DATAGRAM_RECEIVED, base64.c_str (), len); 	
 #else			
@@ -565,7 +595,7 @@ namespace client
 			LogPrint (eLogWarning, "Datagram size ", len," exceeds buffer");
 	}
 
-	SAMSession::SAMSession (ClientDestination * dest):
+	SAMSession::SAMSession (std::shared_ptr<ClientDestination> dest):
 		localDestination (dest)
 	{
 	}
@@ -650,8 +680,15 @@ namespace client
 	{
 		if (!ecode)
 		{
-			LogPrint ("New SAM connection from ", socket->GetSocket ().remote_endpoint ());
-			socket->ReceiveHandshake ();		
+			boost::system::error_code ec;
+			auto ep = socket->GetSocket ().remote_endpoint (ec);
+			if (!ec)
+			{	
+				LogPrint ("New SAM connection from ", ep);
+				socket->ReceiveHandshake ();
+			}
+			else
+				LogPrint (eLogError, "SAM connection from error ", ec.message ());
 		}
 		else
 			LogPrint ("SAM accept error: ",  ecode.message ());
@@ -663,7 +700,7 @@ namespace client
 	SAMSession * SAMBridge::CreateSession (const std::string& id, const std::string& destination, 
 		const std::map<std::string, std::string> * params)
 	{
-		ClientDestination * localDestination = nullptr; 
+		std::shared_ptr<ClientDestination> localDestination = nullptr; 
 		if (destination != "")
 		{
 			i2p::data::PrivateKeys keys;
@@ -681,7 +718,7 @@ namespace client
 					// TODO: extract string values	
 					signatureType = boost::lexical_cast<int> (it->second);
 			}
-			localDestination = i2p::client::context.CreateNewLocalDestination (false, signatureType, params); 
+			localDestination = i2p::client::context.CreateNewLocalDestination (true, signatureType, params); 
 		}
 		if (localDestination)
 		{
@@ -701,13 +738,14 @@ namespace client
 		if (it != m_Sessions.end ())
 		{
 			auto session = it->second;
+			session->localDestination->StopAcceptingStreams ();
 			session->CloseStreams ();
 			m_Sessions.erase (it);
 			delete session;
 		}
 	}
 
-	SAMSession * SAMBridge::FindSession (const std::string& id)
+	SAMSession * SAMBridge::FindSession (const std::string& id) const
 	{
 		std::unique_lock<std::mutex> l(m_SessionsMutex);
 		auto it = m_Sessions.find (id);
@@ -749,7 +787,7 @@ namespace client
 						auto leaseSet = i2p::data::netdb.FindLeaseSet (dest.GetIdentHash ());
 						if (leaseSet)
 							session->localDestination->GetDatagramDestination ()->
-								SendDatagramTo ((uint8_t *)eol, payloadLen, *leaseSet);
+								SendDatagramTo ((uint8_t *)eol, payloadLen, leaseSet);
 						else
 						{
 							LogPrint ("SAM datagram destination not found");
