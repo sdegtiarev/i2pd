@@ -41,13 +41,13 @@ namespace stream
 	const size_t STREAMING_MTU = 1730;
 	const size_t MAX_PACKET_SIZE = 4096;
 	const size_t COMPRESSION_THRESHOLD_SIZE = 66;	
-	const int RESEND_TIMEOUT = 10; // in seconds
 	const int ACK_SEND_TIMEOUT = 200; // in milliseconds
 	const int MAX_NUM_RESEND_ATTEMPTS = 5;	
 	const int WINDOW_SIZE = 6; // in messages
 	const int MIN_WINDOW_SIZE = 1;
 	const int MAX_WINDOW_SIZE = 128;		
 	const int INITIAL_RTT = 8000; // in milliseconds
+	const int INITIAL_RTO = 9000; // in milliseconds
 	
 	struct Packet
 	{
@@ -177,7 +177,7 @@ namespace stream
 
 			std::mutex m_SendBufferMutex;
 			std::stringstream m_SendBuffer;
-			int m_WindowSize, m_RTT;
+			int m_WindowSize, m_RTT, m_RTO;
 			uint64_t m_LastWindowSizeIncreaseTime;
 	};
 
@@ -248,26 +248,15 @@ namespace stream
 	void Stream::HandleReceiveTimer (const boost::system::error_code& ecode, const Buffer& buffer, ReceiveHandler handler)
 	{
 		size_t received = ConcatenatePackets (boost::asio::buffer_cast<uint8_t *>(buffer), boost::asio::buffer_size(buffer));
-		if (ecode == boost::asio::error::operation_aborted)
+		if (received > 0)
+			handler (boost::system::error_code (), received);
+		else if (ecode == boost::asio::error::operation_aborted)
 		{	
 			// timeout not expired	
-			if (m_Status == eStreamStatusOpen)
-				// no error
-				handler (boost::system::error_code (), received); 
+			if (m_Status == eStreamStatusReset)
+				handler (boost::asio::error::make_error_code (boost::asio::error::connection_reset), 0);
 			else
-			{	
-				// stream closed
-				if (m_Status == eStreamStatusReset)
-				{
-					// stream closed by peer
-					handler (received > 0 ? boost::system::error_code () : // we still have some data
-						boost::asio::error::make_error_code (boost::asio::error::connection_reset), // no more data
-						received);
-					
-				}
-				else // stream closed by us
-					handler (boost::asio::error::make_error_code (boost::asio::error::operation_aborted), received); 
-			}	
+				handler (boost::asio::error::make_error_code (boost::asio::error::operation_aborted), 0); 
 		}	
 		else
 			// timeout expired

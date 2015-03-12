@@ -17,7 +17,8 @@ namespace stream
 		m_Status (eStreamStatusNew), m_IsAckSendScheduled (false), m_LocalDestination (local), 
 		m_RemoteLeaseSet (remote), m_ReceiveTimer (m_Service), m_ResendTimer (m_Service), 
 		m_AckSendTimer (m_Service),  m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (port), 
-		m_WindowSize (MIN_WINDOW_SIZE), m_RTT (INITIAL_RTT), m_LastWindowSizeIncreaseTime (0)
+		m_WindowSize (MIN_WINDOW_SIZE), m_RTT (INITIAL_RTT), m_RTO (INITIAL_RTO),
+		m_LastWindowSizeIncreaseTime (0)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 		UpdateCurrentRemoteLease ();
@@ -28,7 +29,7 @@ namespace stream
 		m_Status (eStreamStatusNew), m_IsAckSendScheduled (false), m_LocalDestination (local),
 		m_ReceiveTimer (m_Service), m_ResendTimer (m_Service), m_AckSendTimer (m_Service), 
 		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Port (0),  m_WindowSize (MIN_WINDOW_SIZE), 
-		m_RTT (INITIAL_RTT), m_LastWindowSizeIncreaseTime (0)
+		m_RTT (INITIAL_RTT), m_RTO (INITIAL_RTO), m_LastWindowSizeIncreaseTime (0)
 	{
 		m_RecvStreamID = i2p::context.GetRandomNumberGenerator ().GenerateWord32 ();
 	}
@@ -36,28 +37,29 @@ namespace stream
 	Stream::~Stream ()
 	{	
 		Terminate ();
+		while (!m_ReceiveQueue.empty ())
+		{
+			auto packet = m_ReceiveQueue.front ();
+			m_ReceiveQueue.pop ();
+			delete packet;
+		}
+		
+		for (auto it: m_SentPackets)
+			delete it;
+		m_SentPackets.clear ();
+		
+		for (auto it: m_SavedPackets)
+			delete it;
+		m_SavedPackets.clear ();
+			
 		LogPrint (eLogDebug, "Stream deleted");
 	}	
 
 	void Stream::Terminate ()
 	{
 		m_AckSendTimer.cancel ();
-		while (!m_ReceiveQueue.empty ())
-		{
-			auto packet = m_ReceiveQueue.front ();
-			m_ReceiveQueue.pop ();
-			delete packet;
-		}	
 		m_ReceiveTimer.cancel ();
-					
-		for (auto it: m_SentPackets)
-			delete it;
-		m_SentPackets.clear ();
 		m_ResendTimer.cancel ();
-
-		for (auto it: m_SavedPackets)
-			delete it;
-		m_SavedPackets.clear ();
 	}	
 		
 	void Stream::HandleNextPacket (Packet * packet)
@@ -234,9 +236,6 @@ namespace stream
 					if (nacked)
 					{
 						LogPrint (eLogDebug, "Packet ", seqn, " NACK");
-						(*it)->numResendAttempts++;
-						(*it)->sendTime = ts;
-						SendPackets (std::vector<Packet *> { *it });
 						it++;
 						continue;
 					}	
@@ -244,6 +243,7 @@ namespace stream
 				auto sentPacket = *it;
 				uint64_t rtt = ts - sentPacket->sendTime;
 				m_RTT = (m_RTT*seqn + rtt)/(seqn + 1);
+				m_RTO = m_RTT*1.5; // TODO: implement it better
 				LogPrint (eLogDebug, "Packet ", seqn, " acknowledged rtt=", rtt);
 				m_SentPackets.erase (it++);
 				delete sentPacket;	
@@ -312,7 +312,7 @@ namespace stream
 				size += 4; // ack Through
 				packet[size] = 0; 
 				size++; // NACK count
-				packet[size] = RESEND_TIMEOUT;
+				packet[size] = m_RTO/1000;
 				size++; // resend delay
 				if (m_Status == eStreamStatusNew)
 				{	
@@ -452,12 +452,14 @@ namespace stream
 					LogPrint (eLogInfo, "Trying to send stream data before closing");
 			break;
 			case eStreamStatusReset:
+				SendClose ();
 				Terminate ();
 				m_LocalDestination.DeleteStream (shared_from_this ());	
 			break;
 			case eStreamStatusClosing:
 				if (m_SentPackets.empty () && m_SendBuffer.eof ()) // nothing to send
 				{
+					m_Status = eStreamStatusClosed;
 					SendClose ();
 					Terminate ();
 					m_LocalDestination.DeleteStream (shared_from_this ());	
@@ -475,7 +477,6 @@ namespace stream
 
 	void Stream::SendClose ()
 	{
-		m_Status = eStreamStatusClosed;
 		Packet * p = new Packet ();
 		uint8_t * packet = p->GetBuffer ();
 		size_t size = 0;
@@ -594,7 +595,7 @@ namespace stream
 	void Stream::ScheduleResend ()
 	{
 		m_ResendTimer.cancel ();
-		m_ResendTimer.expires_from_now (boost::posix_time::seconds(RESEND_TIMEOUT));
+		m_ResendTimer.expires_from_now (boost::posix_time::milliseconds(m_RTO));
 		m_ResendTimer.async_wait (std::bind (&Stream::HandleResendTimer,
 			shared_from_this (), std::placeholders::_1));
 	}
@@ -608,6 +609,7 @@ namespace stream
 			std::vector<Packet *> packets;
 			for (auto it : m_SentPackets)
 			{
+				if (ts < it->sendTime + m_RTO) continue; // don't resend too early
 				it->numResendAttempts++;
 				if (first && it->numResendAttempts == 1) // detect congesion at first attempt of first packet only
 					congesion = true;
@@ -638,6 +640,7 @@ namespace stream
 					// congesion avoidance didn't help
 					m_CurrentOutboundTunnel = nullptr; // pick another outbound tunnel 
 					UpdateCurrentRemoteLease (); // pick another lease
+					m_RTO = INITIAL_RTO; // drop RTO to initial upon tunnels pair change
 				}	
 				SendPackets (packets);
 			}	
