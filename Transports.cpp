@@ -96,8 +96,9 @@ namespace transport
 	
 	Transports::Transports (): 
 		m_IsRunning (false), m_Thread (nullptr), m_Work (m_Service), m_PeerCleanupTimer (m_Service),
-		m_NTCPServer (nullptr), m_SSUServer (nullptr), 
-		m_DHKeysPairSupplier (5) // 5 pre-generated keys
+		m_NTCPServer (nullptr), m_SSUServer (nullptr), m_DHKeysPairSupplier (5), // 5 pre-generated keys
+		m_TotalSentBytes(0), m_TotalReceivedBytes(0), m_InBandwidth (0), m_OutBandwidth (0),
+		m_LastInBandwidthUpdateBytes (0), m_LastOutBandwidthUpdateBytes (0), m_LastBandwidthUpdateTime (0)	
 	{		
 	}
 		
@@ -181,6 +182,28 @@ namespace transport
 		}	
 	}
 		
+	void Transports::UpdateBandwidth ()
+	{
+		uint64_t ts = i2p::util::GetMillisecondsSinceEpoch ();
+		if (m_LastBandwidthUpdateTime > 0)
+		{
+			auto delta = ts - m_LastBandwidthUpdateTime;
+			if (delta > 0)
+			{
+				m_InBandwidth = (m_TotalReceivedBytes - m_LastInBandwidthUpdateBytes)*1000/delta; // per second 
+				m_OutBandwidth = (m_TotalSentBytes - m_LastOutBandwidthUpdateBytes)*1000/delta; // per second 
+			} 
+		}
+		m_LastBandwidthUpdateTime = ts;
+		m_LastInBandwidthUpdateBytes = m_TotalReceivedBytes;	
+		m_LastOutBandwidthUpdateBytes = m_TotalSentBytes;		
+	}
+
+	bool Transports::IsBandwidthExceeded () const
+	{
+		if (i2p::context.GetRouterInfo ().IsHighBandwidth ()) return false;
+		return std::max (m_InBandwidth, m_OutBandwidth) > LOW_BANDWIDTH_LIMIT;
+	}
 
 	void Transports::SendMessage (const i2p::data::IdentHash& ident, i2p::I2NPMessage * msg)
 	{
@@ -456,6 +479,12 @@ namespace transport
 		});	
 	}	
 
+	bool Transports::IsConnected (const i2p::data::IdentHash& ident) const
+	{
+		auto it = m_Peers.find (ident);
+		return it != m_Peers.end ();
+	}	
+		
 	void Transports::HandlePeerCleanupTimer (const boost::system::error_code& ecode)
 	{
 		if (ecode != boost::asio::error::operation_aborted)
@@ -471,6 +500,7 @@ namespace transport
 				else
 					it++;
 			}
+			UpdateBandwidth (); // TODO: use separate timer(s) for it
 			m_PeerCleanupTimer.expires_from_now (boost::posix_time::seconds(5*SESSION_CREATION_TIMEOUT));
 			m_PeerCleanupTimer.async_wait (std::bind (&Transports::HandlePeerCleanupTimer, this, std::placeholders::_1));
 		}	

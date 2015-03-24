@@ -173,7 +173,8 @@ namespace data
 					}	
 					lastSave = ts;
 				}	
-				if (ts - lastPublish >= 2400) // publish every 40 minutes
+				if (i2p::context.GetLastUpdateTime () > lastPublish ||  // our router has been updated 
+					ts - lastPublish >= 2400) // or publish every 40 minutes
 				{
 					Publish ();
 					lastPublish = ts;
@@ -356,6 +357,7 @@ namespace data
 					if (!r->IsUnreachable () && (!r->UsesIntroducer () || ts < r->GetTimestamp () + 3600*1000LL)) // 1 hour
 					{	
 						r->DeleteBuffer ();
+						r->ClearProperties (); // properties are not used for regular routers
 						m_RouterInfos[r->GetIdentHash ()] = r;
 						if (r->IsFloodfill ())
 							m_Floodfills.push_back (r);
@@ -566,8 +568,13 @@ namespace data
 				decompressor.MessageEnd();
 				uint8_t uncompressed[2048];
 				size_t uncomressedSize = decompressor.MaxRetrievable ();
-				decompressor.Get (uncompressed, uncomressedSize);
-				AddRouterInfo (buf + DATABASE_STORE_KEY_OFFSET, uncompressed, uncomressedSize);
+				if (uncomressedSize <= 2048)
+				{
+					decompressor.Get (uncompressed, uncomressedSize);
+					AddRouterInfo (buf + DATABASE_STORE_KEY_OFFSET, uncompressed, uncomressedSize);
+				}
+				else
+					LogPrint ("Invalid RouterInfo uncomressed length ", (int)uncomressedSize);
 			}
 			catch (CryptoPP::Exception& ex)
 			{
@@ -822,6 +829,8 @@ namespace data
 			if (floodfill && !floodfills.count (floodfill.get ())) // request floodfill only once
 			{	
 				floodfills.insert (floodfill.get ());
+				if (i2p::transport::transports.IsConnected (floodfill->GetIdentHash ()))
+					throughTunnels = false;
 				if (throughTunnels)
 				{	
 					msgs.push_back (i2p::tunnel::TunnelMessageBlock 
@@ -852,6 +861,7 @@ namespace data
 
 	void NetDb::Publish ()
 	{
+		i2p::context.UpdateStats ();
 		std::set<IdentHash> excluded; // TODO: fill up later
 		for (int i = 0; i < 2; i++)
 		{	
@@ -909,7 +919,7 @@ namespace data
 			[compatibleWith](std::shared_ptr<const RouterInfo> router)->bool 
 			{ 
 				return !router->IsHidden () && router != compatibleWith &&
-					router->IsCompatible (*compatibleWith) && (router->GetCaps () & RouterInfo::eHighBandwidth); 
+					router->IsCompatible (*compatibleWith) && router->IsHighBandwidth (); 
 			});
 	}	
 	

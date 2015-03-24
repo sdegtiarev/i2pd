@@ -105,8 +105,9 @@ namespace data
 			void AddSSUAddress (const char * host, int port, const uint8_t * key, int mtu = 0);
 			bool AddIntroducer (const Address * address, uint32_t tag);
 			bool RemoveIntroducer (const boost::asio::ip::udp::endpoint& e);
-			void SetProperty (const char * key, const char * value);
-			const char * GetProperty (const char * key) const;
+			void SetProperty (const std::string& key, const std::string& value); // called from RouterContext only
+			void DeleteProperty (const std::string& key); // called from RouterContext only
+			void ClearProperties () { m_Properties.clear (); };
 			bool IsFloodfill () const;
 			bool IsNTCP (bool v4only = true) const;
 			bool IsSSU (bool v4only = true) const;
@@ -118,6 +119,7 @@ namespace data
 			bool IsIntroducer () const { return m_Caps & eSSUIntroducer; };
 			bool IsPeerTesting () const { return m_Caps & eSSUTesting; };
 			bool IsHidden () const { return m_Caps & eHidden; };
+			bool IsHighBandwidth () const { return m_Caps & RouterInfo::eHighBandwidth; };
 
 			uint8_t GetCaps () const { return m_Caps; };	
 			void SetCaps (uint8_t caps);

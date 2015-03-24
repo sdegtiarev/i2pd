@@ -17,6 +17,9 @@ namespace i2p
 	const char ROUTER_KEYS[] = "router.keys";	
 	const int ROUTER_INFO_UPDATE_INTERVAL = 1800; // 30 minutes
 	
+	const char ROUTER_INFO_PROPERTY_LEASESETS[] = "netdb.knownLeaseSets";
+	const char ROUTER_INFO_PROPERTY_ROUTERS[] = "netdb.knownRouters";		
+
 	enum RouterStatus
 	{
 		eRouterStatusOK = 0,
@@ -40,6 +43,7 @@ namespace i2p
 			CryptoPP::RandomNumberGenerator& GetRandomNumberGenerator () { return m_Rnd; };	
 			uint32_t GetUptime () const;
 			uint32_t GetStartupTime () const { return m_StartupTime; };
+			uint64_t GetLastUpdateTime () const { return m_LastUpdateTime; };
 			RouterStatus GetStatus () const { return m_Status; };
 			void SetStatus (RouterStatus status) { m_Status = status; };
 
@@ -52,11 +56,14 @@ namespace i2p
 			void SetReachable ();
 			bool IsFloodfill () const { return m_IsFloodfill; };	
 			void SetFloodfill (bool floodfill);	
+			void SetHighBandwidth ();
+			void SetLowBandwidth ();
 			bool AcceptsTunnels () const { return m_AcceptsTunnels; };
 			void SetAcceptsTunnels (bool acceptsTunnels) { m_AcceptsTunnels = acceptsTunnels; };
 			bool SupportsV6 () const { return m_RouterInfo.IsV6 (); };
 			void SetSupportsV6 (bool supportsV6);
-			void UpdateNTCPV6Address (const boost::asio::ip::address& host); // called from NTCP session				
+			void UpdateNTCPV6Address (const boost::asio::ip::address& host); // called from NTCP session		
+			void UpdateStats ();		
 
 			// implements LocalDestination
 			const i2p::data::PrivateKeys& GetPrivateKeys () const { return m_Keys; };

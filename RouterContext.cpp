@@ -1,10 +1,12 @@
 #include <fstream>
 #include <cryptopp/dh.h>
 #include <cryptopp/dsa.h>
+#include <boost/lexical_cast.hpp>
 #include "CryptoConst.h"
 #include "RouterContext.h"
 #include "Timestamp.h"
 #include "I2NPProtocol.h"
+#include "NetDb.h"
 #include "util.h"
 #include "version.h"
 
@@ -115,8 +117,31 @@ namespace i2p
 		if (floodfill)
 			m_RouterInfo.SetCaps (m_RouterInfo.GetCaps () | i2p::data::RouterInfo::eFloodfill);
 		else
+		{
 			m_RouterInfo.SetCaps (m_RouterInfo.GetCaps () & ~i2p::data::RouterInfo::eFloodfill);
+			// we don't publish number of routers and leaseset for non-floodfill
+			m_RouterInfo.DeleteProperty (ROUTER_INFO_PROPERTY_LEASESETS);
+			m_RouterInfo.DeleteProperty (ROUTER_INFO_PROPERTY_ROUTERS);
+		}
 		UpdateRouterInfo ();
+	}
+
+	void RouterContext::SetHighBandwidth ()
+	{
+		if (!m_RouterInfo.IsHighBandwidth ())
+		{
+			m_RouterInfo.SetCaps (m_RouterInfo.GetCaps () | i2p::data::RouterInfo::eHighBandwidth);
+			UpdateRouterInfo ();
+		}
+	}
+
+	void RouterContext::SetLowBandwidth ()
+	{
+		if (m_RouterInfo.IsHighBandwidth ())
+		{
+			m_RouterInfo.SetCaps (m_RouterInfo.GetCaps () & ~i2p::data::RouterInfo::eHighBandwidth);
+			UpdateRouterInfo ();
+		}
 	}
 
 	bool RouterContext::IsUnreachable () const
@@ -219,6 +244,17 @@ namespace i2p
 		}
 		if (updated)
 			UpdateRouterInfo ();
+	}
+
+	void RouterContext::UpdateStats ()
+	{
+		if (m_IsFloodfill)
+		{
+			// update routers and leasesets
+			m_RouterInfo.SetProperty (ROUTER_INFO_PROPERTY_LEASESETS, boost::lexical_cast<std::string>(i2p::data::netdb.GetNumLeaseSets ()));
+			m_RouterInfo.SetProperty (ROUTER_INFO_PROPERTY_ROUTERS, boost::lexical_cast<std::string>(i2p::data::netdb.GetNumRouters ()));
+			UpdateRouterInfo (); 
+		}
 	}
 		
 	bool RouterContext::Load ()

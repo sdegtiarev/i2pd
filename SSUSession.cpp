@@ -16,8 +16,8 @@ namespace transport
 	SSUSession::SSUSession (SSUServer& server, boost::asio::ip::udp::endpoint& remoteEndpoint,
 		std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest ): TransportSession (router), 
 		m_Server (server), m_RemoteEndpoint (remoteEndpoint), m_Timer (GetService ()), 
-		m_PeerTest (peerTest),m_State (eSessionStateUnknown), m_IsSessionKey (false), m_RelayTag (0),
-		m_NumSentBytes (0), m_NumReceivedBytes (0), m_Data (*this), m_IsDataReceived (false)
+		m_PeerTest (peerTest),m_State (eSessionStateUnknown), m_IsSessionKey (false), 
+		m_RelayTag (0),m_Data (*this), m_IsDataReceived (false)
 	{
 		m_CreationTime = i2p::util::GetSecondsSinceEpoch ();
 	}
@@ -78,6 +78,7 @@ namespace transport
 	void SSUSession::ProcessNextMessage (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& senderEndpoint)
 	{
 		m_NumReceivedBytes += len;
+		i2p::transport::transports.UpdateReceivedBytes (len);
 		if (m_State == eSessionStateIntroduced)
 		{
 			// HolePunch received
@@ -238,6 +239,7 @@ namespace transport
 		// verify
 		if (!s.Verify (m_RemoteIdentity, payload))
 			LogPrint (eLogError, "SSU signature verification failed");
+		m_RemoteIdentity.DropVerifier ();	
 		
 		SendSessionConfirmed (y, ourAddress, addressSize + 2);
 	}	
@@ -1092,6 +1094,8 @@ namespace transport
 	{
 		uint8_t buf[SSU_MTU_V4 + 18];
 		size_t msgSize = len + sizeof (SSUHeader); 
+		size_t paddingSize = msgSize >> 4; // %16
+		if (paddingSize > 0) msgSize += (16 - paddingSize);
 		if (msgSize > SSU_MTU_V4)
 		{
 			LogPrint (eLogWarning, "SSU payload size ", msgSize, " exceeds MTU");
@@ -1106,6 +1110,7 @@ namespace transport
 	void SSUSession::Send (const uint8_t * buf, size_t size)
 	{
 		m_NumSentBytes += size;
+		i2p::transport::transports.UpdateSentBytes (size);
 		m_Server.Send (buf, size, m_RemoteEndpoint);
 	}	
 }
