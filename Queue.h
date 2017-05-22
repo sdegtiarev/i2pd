@@ -7,6 +7,7 @@
 #include <thread>
 #include <condition_variable>
 #include <functional>
+#include <utility>
 
 namespace i2p
 {
@@ -17,28 +18,29 @@ namespace util
 	{	
 		public:
 
-			void Put (Element * e)
+			void Put (Element e)
 			{
 				std::unique_lock<std::mutex>  l(m_QueueMutex);
-				m_Queue.push (e);	
+				m_Queue.push (std::move(e));
 				m_NonEmpty.notify_one ();
 			}
 
-			void Put (const std::vector<Element *>& vec)
+			template<template<typename, typename...>class Container, typename... R>
+			void Put (const Container<Element, R...>& vec)
 			{
 				if (!vec.empty ())
 				{	
 					std::unique_lock<std::mutex>  l(m_QueueMutex);
-					for (auto it: vec)
+					for (const auto& it: vec)
 						m_Queue.push (it);	
 					m_NonEmpty.notify_one ();
 				}	
 			}
 			
-			Element * GetNext ()
+			Element GetNext ()
 			{
 				std::unique_lock<std::mutex> l(m_QueueMutex);
-				Element * el = GetNonThreadSafe ();
+				auto el = GetNonThreadSafe ();
 				if (!el)
 				{
 					m_NonEmpty.wait (l);
@@ -47,10 +49,10 @@ namespace util
 				return el;
 			}
 
-			Element * GetNextWithTimeout (int usec)
+			Element GetNextWithTimeout (int usec)
 			{
 				std::unique_lock<std::mutex> l(m_QueueMutex);
-				Element * el = GetNonThreadSafe ();
+				auto el = GetNonThreadSafe ();
 				if (!el)
 				{
 					m_NonEmpty.wait_for (l, std::chrono::milliseconds (usec));
@@ -85,13 +87,13 @@ namespace util
 
 			void WakeUp () { m_NonEmpty.notify_all (); };
 
-			Element * Get ()
+			Element Get ()
 			{
 				std::unique_lock<std::mutex> l(m_QueueMutex);
 				return GetNonThreadSafe ();
 			}	
 
-			Element * Peek ()
+			Element Peek ()
 			{
 				std::unique_lock<std::mutex> l(m_QueueMutex);
 				return GetNonThreadSafe (true);
@@ -99,11 +101,11 @@ namespace util
 			
 		private:
 
-			Element * GetNonThreadSafe (bool peek = false)
+			Element GetNonThreadSafe (bool peek = false)
 			{
 				if (!m_Queue.empty ())
 				{
-					Element * el = m_Queue.front ();
+					auto el = m_Queue.front ();
 					if (!peek)
 						m_Queue.pop ();
 					return el;
@@ -113,55 +115,9 @@ namespace util
 			
 		private:
 
-			std::queue<Element *> m_Queue;
+			std::queue<Element> m_Queue;
 			std::mutex m_QueueMutex;
 			std::condition_variable m_NonEmpty;
-	};	
-
-	template<class Msg>
-	class MsgQueue: public Queue<Msg>
-	{
-		public:
-
-			typedef std::function<void()> OnEmpty;
-
-			MsgQueue (): m_IsRunning (true), m_Thread (std::bind (&MsgQueue<Msg>::Run, this))  {};
-			~MsgQueue () { Stop (); };
-			void Stop()
-			{
-				if (m_IsRunning)
-				{
-					m_IsRunning = false;
-					Queue<Msg>::WakeUp ();					
-					m_Thread.join();
-				}
-			}
-
-			void SetOnEmpty (OnEmpty const & e) { m_OnEmpty = e; };
-
-		private:
-
-			void Run ()
-			{
-				while (m_IsRunning)
-				{
-					while (Msg * msg = Queue<Msg>::Get ())
-					{
-						msg->Process ();
-						delete msg;
-					}
-					if (m_OnEmpty != nullptr)
-						m_OnEmpty ();
-					if (m_IsRunning)
-						Queue<Msg>::Wait ();
-				}	
-			}	
-			
-		private:
-			
-			volatile bool m_IsRunning;
-			OnEmpty m_OnEmpty;
-			std::thread m_Thread;	
 	};	
 }		
 }	

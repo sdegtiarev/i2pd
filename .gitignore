@@ -5,12 +5,17 @@ router.keys
 i2p
 libi2pd.so
 netDb
+/i2pd
+/libi2pd.a
+/libi2pdclient.a
+i2pd.exe
+
 
 # Autotools
 autom4te.cache
 .deps
 stamp-h1
-Makefile
+#Makefile
 config.h
 config.h.in~
 config.log
@@ -230,3 +235,17 @@ pip-log.txt
 
 #Mr Developer
 .mr.developer.cfg
+
+# Sphinx
+docs/_build
+/androidIdea/
+
+# Doxygen
+docs/generated
+
+# emacs files
+*~
+*\#*
+
+# gdb files
+.gdb_history

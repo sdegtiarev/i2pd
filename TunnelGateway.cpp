@@ -1,6 +1,6 @@
 #include <string.h>
+#include "Crypto.h"
 #include "I2PEndian.h"
-#include <cryptopp/sha.h>
 #include "Log.h"
 #include "RouterContext.h"
 #include "Transports.h"
@@ -10,10 +10,17 @@ namespace i2p
 {
 namespace tunnel
 {
+	TunnelGatewayBuffer::TunnelGatewayBuffer ():  
+		m_CurrentTunnelDataMsg (nullptr), m_RemainingSize (0) 
+	{
+		RAND_bytes (m_NonZeroRandomBuffer, TUNNEL_DATA_MAX_PAYLOAD_SIZE);
+		for (size_t i = 0; i < TUNNEL_DATA_MAX_PAYLOAD_SIZE; i++)
+			if (!m_NonZeroRandomBuffer[i]) m_NonZeroRandomBuffer[i] = 1;
+	}
+
 	TunnelGatewayBuffer::~TunnelGatewayBuffer ()
 	{
-		for (auto it: m_TunnelDataMsgs)
-			DeleteI2NPMessage (it);
+		ClearTunnelDataMsgs ();
 	}	
 	
 	void TunnelGatewayBuffer::PutI2NPMsg (const TunnelMessageBlock& block)
@@ -42,8 +49,8 @@ namespace tunnel
 		di[0] = block.deliveryType << 5; // set delivery type
 
 		// create fragments
-		I2NPMessage * msg = block.data;
-		auto fullMsgLen = diLen + msg->GetLength () + 2; // delivery instructions + payload + 2 bytes length
+		const std::shared_ptr<I2NPMessage> & msg = block.data;
+		size_t fullMsgLen = diLen + msg->GetLength () + 2; // delivery instructions + payload + 2 bytes length
 		if (fullMsgLen <= m_RemainingSize)
 		{
 			// message fits. First and last fragment
@@ -55,16 +62,15 @@ namespace tunnel
 			m_RemainingSize -= diLen + msg->GetLength ();
 			if (!m_RemainingSize)
 				CompleteCurrentTunnelDataMessage ();
-			DeleteI2NPMessage (msg);
 		}	
 		else
 		{
 			if (!messageCreated) // check if we should complete previous message
 			{	
-				auto numFollowOnFragments = fullMsgLen / TUNNEL_DATA_MAX_PAYLOAD_SIZE;
+				size_t numFollowOnFragments = fullMsgLen / TUNNEL_DATA_MAX_PAYLOAD_SIZE;
 				// length of bytes don't fit full tunnel message
 				// every follow-on fragment adds 7 bytes
-				auto nonFit = (fullMsgLen + numFollowOnFragments*7) % TUNNEL_DATA_MAX_PAYLOAD_SIZE; 
+				size_t nonFit = (fullMsgLen + numFollowOnFragments*7) % TUNNEL_DATA_MAX_PAYLOAD_SIZE; 
 				if (!nonFit || nonFit > m_RemainingSize)
 				{
 					CompleteCurrentTunnelDataMessage ();
@@ -110,16 +116,19 @@ namespace tunnel
 					m_CurrentTunnelDataMsg->len += s+7;
 					if (isLastFragment)
 					{
-						m_RemainingSize -= s+7; 
-						if (!m_RemainingSize)
-							CompleteCurrentTunnelDataMessage ();
+						if(m_RemainingSize < (s+7)) {
+							LogPrint (eLogError, "TunnelGateway: remaining size overflow: ", m_RemainingSize, " < ", s+7);
+						} else {
+							m_RemainingSize -= s+7; 
+							if (m_RemainingSize == 0)
+								CompleteCurrentTunnelDataMessage ();
+						}
 					}
 					else
 						CompleteCurrentTunnelDataMessage ();
 					size += s;
 					fragmentNumber++;
 				}
-				DeleteI2NPMessage (msg);
 			}	
 			else
 			{
@@ -134,10 +143,12 @@ namespace tunnel
 	void TunnelGatewayBuffer::ClearTunnelDataMsgs ()
 	{
 		m_TunnelDataMsgs.clear ();
+		m_CurrentTunnelDataMsg = nullptr;
 	}
 
 	void TunnelGatewayBuffer::CreateCurrentTunnelDataMessage ()
 	{
+		m_CurrentTunnelDataMsg = nullptr;
 		m_CurrentTunnelDataMsg = NewI2NPShortMessage ();
 		m_CurrentTunnelDataMsg->Align (12);
 		// we reserve space for padding
@@ -154,23 +165,25 @@ namespace tunnel
 		
 		m_CurrentTunnelDataMsg->offset = m_CurrentTunnelDataMsg->len - TUNNEL_DATA_MSG_SIZE - I2NP_HEADER_SIZE;
 		uint8_t * buf = m_CurrentTunnelDataMsg->GetPayload ();
-		htobe32buf (buf, m_TunnelID);
-		CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
-		rnd.GenerateBlock (buf + 4, 16); // original IV	
+		RAND_bytes (buf + 4, 16); // original IV	
 		memcpy (payload + size, buf + 4, 16); // copy IV for checksum 
 		uint8_t hash[32];
-		CryptoPP::SHA256().CalculateDigest (hash, payload, size+16);
+		SHA256(payload, size+16, hash);
 		memcpy (buf+20, hash, 4); // checksum		
 		payload[-1] = 0; // zero	
 		ptrdiff_t paddingSize = payload - buf - 25; // 25  = 24 + 1 
 		if (paddingSize > 0)
-			memset (buf + 24, 1, paddingSize); // padding TODO: fill with random data
+		{
+			// non-zero padding 
+			auto randomOffset = rand () % (TUNNEL_DATA_MAX_PAYLOAD_SIZE - paddingSize + 1);
+			memcpy (buf + 24, m_NonZeroRandomBuffer + randomOffset, paddingSize); 
+		}
 
 		// we can't fill message header yet because encryption is required
 		m_TunnelDataMsgs.push_back (m_CurrentTunnelDataMsg);
 		m_CurrentTunnelDataMsg = nullptr;
 	}	
-	
+
 	void TunnelGateway::SendTunnelDataMsg (const TunnelMessageBlock& block)
 	{
 		if (block.data)
@@ -189,15 +202,19 @@ namespace tunnel
 	void TunnelGateway::SendBuffer ()
 	{
 		m_Buffer.CompleteCurrentTunnelDataMessage ();
-		auto tunnelMsgs = m_Buffer.GetTunnelDataMsgs ();
-		for (auto tunnelMsg : tunnelMsgs)
+		std::vector<std::shared_ptr<I2NPMessage> > newTunnelMsgs;
+		const auto& tunnelDataMsgs = m_Buffer.GetTunnelDataMsgs ();
+		for (auto& tunnelMsg : tunnelDataMsgs)
 		{	
-			m_Tunnel->EncryptTunnelMsg (tunnelMsg);
-			FillI2NPMessageHeader (tunnelMsg, eI2NPTunnelData);
+			auto newMsg = CreateEmptyTunnelDataMsg ();
+			m_Tunnel->EncryptTunnelMsg (tunnelMsg, newMsg); 
+			htobe32buf (newMsg->GetPayload (), m_Tunnel->GetNextTunnelID ());
+			newMsg->FillI2NPMessageHeader (eI2NPTunnelData); 
+			newTunnelMsgs.push_back (newMsg);
 			m_NumSentBytes += TUNNEL_DATA_MSG_SIZE;
 		}	
-		i2p::transport::transports.SendMessages (m_Tunnel->GetNextIdentHash (), tunnelMsgs);
 		m_Buffer.ClearTunnelDataMsgs ();
+		i2p::transport::transports.SendMessages (m_Tunnel->GetNextIdentHash (), newTunnelMsgs);
 	}	
 }		
 }	

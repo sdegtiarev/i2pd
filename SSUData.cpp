@@ -5,6 +5,9 @@
 #include "NetDb.h"
 #include "SSU.h"
 #include "SSUData.h"
+#ifdef WITH_EVENTS
+#include "Event.h"
+#endif
 
 namespace i2p
 {
@@ -14,26 +17,22 @@ namespace transport
 	{
 		if (msg->len + fragmentSize > msg->maxLen)
 		{
-			LogPrint (eLogInfo, "SSU I2NP message size ", msg->maxLen, " is not enough");
-			I2NPMessage * newMsg = NewI2NPMessage ();
+			LogPrint (eLogWarning, "SSU: I2NP message size ", msg->maxLen, " is not enough");
+			auto newMsg = NewI2NPMessage ();
 			*newMsg = *msg;
-			DeleteI2NPMessage (msg);
 			msg = newMsg;
 		}
-		memcpy (msg->buf + msg->len, fragment, fragmentSize);
-		msg->len += fragmentSize;
+		if (msg->Concat (fragment, fragmentSize) < fragmentSize)
+			LogPrint (eLogError, "SSU: I2NP buffer overflow ", msg->maxLen);
 		nextFragmentNum++;
 	}
 
 	SSUData::SSUData (SSUSession& session):
-		m_Session (session), m_ResendTimer (session.GetService ()), m_DecayTimer (session.GetService ()),
-		m_IncompleteMessagesCleanupTimer (session.GetService ())
+		m_Session (session), m_ResendTimer (session.GetService ()), 
+		m_IncompleteMessagesCleanupTimer (session.GetService ()), 
+		m_MaxPacketSize (session.IsV6 () ? SSU_V6_MAX_PACKET_SIZE : SSU_V4_MAX_PACKET_SIZE), 
+		m_PacketSize (m_MaxPacketSize), m_LastMessageReceivedTime (0)
 	{
-		m_MaxPacketSize = session.IsV6 () ? SSU_V6_MAX_PACKET_SIZE : SSU_V4_MAX_PACKET_SIZE;
-		m_PacketSize = m_MaxPacketSize;
-		auto remoteRouter = session.GetRemoteRouter ();
-		if (remoteRouter)
-			AdjustPacketSize (*remoteRouter);
 	}
 
 	SSUData::~SSUData ()
@@ -48,30 +47,33 @@ namespace transport
 	void SSUData::Stop ()
 	{
 		m_ResendTimer.cancel ();
-		m_DecayTimer.cancel ();
 		m_IncompleteMessagesCleanupTimer.cancel ();
+		m_IncompleteMessages.clear ();
+		m_SentMessages.clear ();
+		m_ReceivedMessages.clear ();
 	}	
 		
-	void SSUData::AdjustPacketSize (const i2p::data::RouterInfo& remoteRouter)
+	void SSUData::AdjustPacketSize (std::shared_ptr<const i2p::data::RouterInfo> remoteRouter)
 	{
-		auto ssuAddress = remoteRouter.GetSSUAddress ();
-		if (ssuAddress && ssuAddress->mtu)
+		if (!remoteRouter) return;
+		auto ssuAddress = remoteRouter->GetSSUAddress ();
+		if (ssuAddress && ssuAddress->ssu->mtu)
 		{
 			if (m_Session.IsV6 ())
-				m_PacketSize = ssuAddress->mtu - IPV6_HEADER_SIZE - UDP_HEADER_SIZE;
+				m_PacketSize = ssuAddress->ssu->mtu - IPV6_HEADER_SIZE - UDP_HEADER_SIZE;
 			else
-				m_PacketSize = ssuAddress->mtu - IPV4_HEADER_SIZE - UDP_HEADER_SIZE;
+				m_PacketSize = ssuAddress->ssu->mtu - IPV4_HEADER_SIZE - UDP_HEADER_SIZE;
 			if (m_PacketSize > 0)
 			{
 				// make sure packet size multiple of 16
 				m_PacketSize >>= 4;
 				m_PacketSize <<= 4;
 				if (m_PacketSize > m_MaxPacketSize) m_PacketSize = m_MaxPacketSize;
-				LogPrint ("MTU=", ssuAddress->mtu, " packet size=", m_PacketSize); 
+				LogPrint (eLogDebug, "SSU: MTU=", ssuAddress->ssu->mtu, " packet size=", m_PacketSize);
 			}
 			else
 			{	
-				LogPrint (eLogWarning, "Unexpected MTU ", ssuAddress->mtu);
+				LogPrint (eLogWarning, "SSU: Unexpected MTU ", ssuAddress->ssu->mtu);
 				m_PacketSize = m_MaxPacketSize;
 			}	
 		}		
@@ -81,7 +83,7 @@ namespace transport
 	{
  		auto routerInfo = i2p::data::netdb.FindRouter (remoteIdent);
 		if (routerInfo)
-			AdjustPacketSize (*routerInfo);
+			AdjustPacketSize (routerInfo);
 	}
 
 	void SSUData::ProcessSentMessageAck (uint32_t msgID)
@@ -155,17 +157,16 @@ namespace transport
 		{	
 			uint32_t msgID = bufbe32toh (buf); // message ID
 			buf += 4;
-			uint8_t frag[4];
-			frag[0] = 0;
+			uint8_t frag[4] = {0};
 			memcpy (frag + 1, buf, 3);
 			buf += 3;
 			uint32_t fragmentInfo = bufbe32toh (frag); // fragment info
-			uint16_t fragmentSize = fragmentInfo & 0x1FFF; // bits 0 - 13
+			uint16_t fragmentSize = fragmentInfo & 0x3FFF; // bits 0 - 13
 			bool isLast = fragmentInfo & 0x010000; // bit 16	
 			uint8_t fragmentNum = fragmentInfo >> 17; // bits 23 - 17 		
 			if (fragmentSize >= SSU_V4_MAX_PACKET_SIZE)
 			{
-				LogPrint (eLogError, "Fragment size ", fragmentSize, "exceeds max SSU packet size");
+				LogPrint (eLogError, "SSU: Fragment size ", fragmentSize, " exceeds max SSU packet size");
 				return;
 			}
 
@@ -202,23 +203,23 @@ namespace transport
 							break;
 					}
 					if (isLast)
-						LogPrint (eLogDebug, "Message ", msgID, " complete");
+						LogPrint (eLogDebug, "SSU: Message ", msgID, " complete");
 				}	
 			}	
 			else
 			{	
 				if (fragmentNum < incompleteMessage->nextFragmentNum)
 					// duplicate fragment
-					LogPrint (eLogWarning, "Duplicate fragment ", (int)fragmentNum, " of message ", msgID, ". Ignored");	
+					LogPrint (eLogWarning, "SSU: Duplicate fragment ", (int)fragmentNum, " of message ", msgID, ", ignored");
 				else
 				{
 					// missing fragment
-					LogPrint (eLogWarning, "Missing fragments from ", (int)incompleteMessage->nextFragmentNum, " to ", fragmentNum - 1, " of message ", msgID);	
+					LogPrint (eLogWarning, "SSU: Missing fragments from ", (int)incompleteMessage->nextFragmentNum, " to ", fragmentNum - 1, " of message ", msgID);
 					auto savedFragment = new Fragment (fragmentNum, buf, fragmentSize, isLast);
 					if (incompleteMessage->savedFragments.insert (std::unique_ptr<Fragment>(savedFragment)).second)
 						incompleteMessage->lastFragmentInsertTime = i2p::util::GetSecondsSinceEpoch ();
 					else	
-						LogPrint (eLogWarning, "Fragment ", (int)fragmentNum, " of message ", msgID, " already saved");
+						LogPrint (eLogWarning, "SSU: Fragment ", (int)fragmentNum, " of message ", msgID, " already saved");
 				}
 				isLast = false;
 			}	
@@ -236,30 +237,31 @@ namespace transport
 				{
 					if (!m_ReceivedMessages.count (msgID))
 					{	
-						if (m_ReceivedMessages.size () > MAX_NUM_RECEIVED_MESSAGES)
-							m_ReceivedMessages.clear ();
-						else
-							ScheduleDecay ();
 						m_ReceivedMessages.insert (msgID);
-						m_Handler.PutNextMessage (msg);
+						m_LastMessageReceivedTime = i2p::util::GetSecondsSinceEpoch ();
+						if (!msg->IsExpired ()) 
+						{
+#ifdef WITH_EVENTS
+							QueueIntEvent("transport.recvmsg", m_Session.GetIdentHashBase64(), 1);
+#endif
+							m_Handler.PutNextMessage (msg);
+						}
+						else
+							LogPrint (eLogDebug, "SSU: message expired");
 					}	
 					else
-					{
-						LogPrint (eLogWarning, "SSU message ", msgID, " already received");						
-						i2p::DeleteI2NPMessage (msg);
-					}	
+						LogPrint (eLogWarning, "SSU: Message ", msgID, " already received");
 				}	
 				else
 				{
 					// we expect DeliveryStatus
 					if (msg->GetTypeID () == eI2NPDeliveryStatus)
 					{
-						LogPrint ("SSU session established");
+						LogPrint (eLogDebug, "SSU: session established");
 						m_Session.Established ();
 					}	
 					else
-						LogPrint (eLogError, "SSU unexpected message ", (int)msg->GetTypeID ());
-					DeleteI2NPMessage (msg);
+						LogPrint (eLogError, "SSU: unexpected message ", (int)msg->GetTypeID ());
 				}	
 			}	
 			else
@@ -278,7 +280,7 @@ namespace transport
 		//uint8_t * start = buf;
 		uint8_t flag = *buf;
 		buf++;
-		LogPrint (eLogDebug, "Process SSU data flags=", (int)flag, " len=", len);
+		LogPrint (eLogDebug, "SSU: Process data, flags=", (int)flag, ", len=", len);
 		// process acks if presented
 		if (flag & (DATA_FLAG_ACK_BITFIELDS_INCLUDED | DATA_FLAG_EXPLICIT_ACKS_INCLUDED))
 			ProcessAcks (buf, flag);
@@ -287,20 +289,19 @@ namespace transport
 		{
 			uint8_t extendedDataSize = *buf;
 			buf++; // size
-			LogPrint (eLogDebug, "SSU extended data of ", extendedDataSize, " bytes presented");
+			LogPrint (eLogDebug, "SSU: extended data of ", extendedDataSize, " bytes present");
 			buf += extendedDataSize;
 		}
 		// process data
 		ProcessFragments (buf);
 	}
 
-	void SSUData::Send (i2p::I2NPMessage * msg)
+	void SSUData::Send (std::shared_ptr<i2p::I2NPMessage> msg)
 	{
 		uint32_t msgID = msg->ToSSU ();
 		if (m_SentMessages.count (msgID) > 0)
 		{
-			LogPrint (eLogWarning, "SSU message ", msgID, " already sent");
-			DeleteI2NPMessage (msg);
+			LogPrint (eLogWarning, "SSU: message ", msgID, " already sent");
 			return;
 		}	
 		if (m_SentMessages.empty ()) // schedule resend at first message only
@@ -357,7 +358,7 @@ namespace transport
 			}
 			catch (boost::system::system_error& ec)
 			{
-				LogPrint (eLogError, "Can't send SSU fragment ", ec.what ());
+				LogPrint (eLogWarning, "SSU: Can't send data fragment ", ec.what ());
 			}	
 			if (!isLast)
 			{	
@@ -368,18 +369,17 @@ namespace transport
 				len = 0;
 			fragmentNum++;
 		}	
-		DeleteI2NPMessage (msg);
 	}		
 
 	void SSUData::SendMsgAck (uint32_t msgID)
 	{
-		uint8_t buf[48 + 18]; // actual length is 44 = 37 + 7 but pad it to multiple of 16
+		uint8_t buf[48 + 18] = {0}; // actual length is 44 = 37 + 7 but pad it to multiple of 16
 		uint8_t * payload = buf + sizeof (SSUHeader);
 		*payload = DATA_FLAG_EXPLICIT_ACKS_INCLUDED; // flag
 		payload++;
 		*payload = 1; // number of ACKs
 		payload++;
-		*(uint32_t *)(payload) = htobe32 (msgID); // msgID	
+		htobe32buf (payload, msgID); // msgID
 		payload += 4;
 		*payload = 0; // number of fragments
 
@@ -392,10 +392,10 @@ namespace transport
 	{
 		if (fragmentNum > 64)
 		{
-			LogPrint (eLogWarning, "Fragment number ", fragmentNum, " exceeds 64");
+			LogPrint (eLogWarning, "SSU: Fragment number ", fragmentNum, " exceeds 64");
 			return;
 		}
-		uint8_t buf[64 + 18];
+		uint8_t buf[64 + 18] = {0};
 		uint8_t * payload = buf + sizeof (SSUHeader);
 		*payload = DATA_FLAG_ACK_BITFIELDS_INCLUDED; // flag
 		payload++;	
@@ -431,55 +431,49 @@ namespace transport
 		if (ecode != boost::asio::error::operation_aborted)
 		{
 			uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
+			int numResent = 0;
 			for (auto it = m_SentMessages.begin (); it != m_SentMessages.end ();)
 			{
 				if (ts >= it->second->nextResendTime)
 				{	
 					if (it->second->numResends < MAX_NUM_RESENDS)
-					{	
+					{
 						for (auto& f: it->second->fragments)
-							if (f) 
+							if (f)
 							{
 								try
-								{	
+								{
 									m_Session.Send (f->buf, f->len); // resend
+									numResent++;
 								}
 								catch (boost::system::system_error& ec)
 								{
-									LogPrint (eLogError, "Can't resend SSU fragment ", ec.what ());
+									LogPrint (eLogWarning, "SSU: Can't resend data fragment ", ec.what ());
 								}
-							}	
+							}
 
 						it->second->numResends++;
 						it->second->nextResendTime += it->second->numResends*RESEND_INTERVAL;
-						it++;
+						++it;
 					}	
 					else
 					{
-						LogPrint (eLogError, "SSU message has not been ACKed after ", MAX_NUM_RESENDS, " attempts. Deleted");
+						LogPrint (eLogInfo, "SSU: message has not been ACKed after ", MAX_NUM_RESENDS, " attempts, deleted");
 						it = m_SentMessages.erase (it);
 					}	
 				}	
 				else
-					it++;
+					++it;
 			}
-			ScheduleResend ();	
+			if (m_SentMessages.empty ()) return; // nothing to resend
+			if (numResent < MAX_OUTGOING_WINDOW_SIZE)
+				ScheduleResend ();
+			else
+			{
+				LogPrint (eLogError, "SSU: resend window exceeds max size. Session terminated");
+				m_Session.Close ();
+			}	
 		}	
-	}	
-
-	void SSUData::ScheduleDecay ()
-	{		
-		m_DecayTimer.cancel ();
-		m_DecayTimer.expires_from_now (boost::posix_time::seconds(DECAY_INTERVAL));
-		auto s = m_Session.shared_from_this();
-		m_ResendTimer.async_wait ([s](const boost::system::error_code& ecode)
-			{ s->m_Data.HandleDecayTimer (ecode); });
-	}	
-
-	void SSUData::HandleDecayTimer (const boost::system::error_code& ecode)
-	{
-		if (ecode != boost::asio::error::operation_aborted)
-			m_ReceivedMessages.clear ();
 	}	
 
 	void SSUData::ScheduleIncompleteMessagesCleanup ()
@@ -500,12 +494,17 @@ namespace transport
 			{
 				if (ts > it->second->lastFragmentInsertTime + INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT)
 				{
-					LogPrint (eLogError, "SSU message ", it->first, " was not completed  in ", INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT, " seconds. Deleted");
+					LogPrint (eLogWarning, "SSU: message ", it->first, " was not completed  in ", INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT, " seconds, deleted");
 					it = m_IncompleteMessages.erase (it);
 				}	
 				else
-					it++;
+					++it;
 			}	
+			// decay
+			if (m_ReceivedMessages.size () > MAX_NUM_RECEIVED_MESSAGES ||
+			    i2p::util::GetSecondsSinceEpoch () > m_LastMessageReceivedTime + DECAY_INTERVAL)
+				m_ReceivedMessages.clear ();
+			
 			ScheduleIncompleteMessagesCleanup ();
 		}	
 	}	

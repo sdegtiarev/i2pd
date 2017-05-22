@@ -1,11 +1,8 @@
-#pragma once
-#include <string>
+#ifndef DAEMON_H__
+#define DAEMON_H__
 
-#ifdef _WIN32
-#define Daemon i2p::util::DaemonWin32::Instance()
-#else
-#define Daemon i2p::util::DaemonLinux::Instance()
-#endif
+#include <memory>
+#include <string>
 
 namespace i2p
 {
@@ -18,24 +15,52 @@ namespace i2p
 			virtual bool init(int argc, char* argv[]);
 			virtual bool start();
 			virtual bool stop();
+			virtual void run () {};
 
-			int isLogging;
-			int isDaemon;
-			
-			int running;
+			bool isDaemon;
+			bool running;
 
 		protected:
 			Daemon_Singleton();
 			virtual ~Daemon_Singleton();
 
-			bool IsService () const;				
+			bool IsService () const;
 
 			// d-pointer for httpServer, httpProxy, etc.
 			class Daemon_Singleton_Private;
 			Daemon_Singleton_Private &d;
 		};
 
-#ifdef _WIN32
+#if defined(QT_GUI_LIB) // check if QT
+#define Daemon i2p::util::DaemonQT::Instance()
+	// dummy, invoked from RunQT	
+    class DaemonQT: public i2p::util::Daemon_Singleton
+	{
+		public:
+
+			static DaemonQT& Instance()
+			{
+				static DaemonQT instance;
+				return instance;
+			}
+    };
+
+#elif defined(ANDROID)
+#define Daemon i2p::util::DaemonAndroid::Instance()
+	// dummy, invoked from android/jni/DaemonAndroid.*
+    class DaemonAndroid: public i2p::util::Daemon_Singleton
+	{
+		public:
+
+			static DaemonAndroid& Instance()
+			{
+				static DaemonAndroid instance;
+				return instance;
+			}
+    };
+
+#elif defined(_WIN32)
+#define Daemon i2p::util::DaemonWin32::Instance()
 		class DaemonWin32 : public Daemon_Singleton
 		{
 		public:
@@ -45,27 +70,38 @@ namespace i2p
 				return instance;
 			}
 
-			virtual bool init(int argc, char* argv[]);
-			virtual bool start();
-			virtual bool stop();
+			bool init(int argc, char* argv[]);
+			bool start();
+			bool stop();
+			void run ();
 		};
 #else
-		class DaemonLinux : public Daemon_Singleton
+#define Daemon i2p::util::DaemonLinux::Instance()
+        class DaemonLinux : public Daemon_Singleton
 		{
-		public:
-			static DaemonLinux& Instance()
-			{
-				static DaemonLinux instance;
-				return instance;
-			}
+			public:
+				static DaemonLinux& Instance()
+				{
+					static DaemonLinux instance;
+					return instance;
+				}
 
-			virtual bool start();
-			virtual bool stop();
-                private:
-                       std::string pidfile;
-                       int pidFilehandle;
+				bool start();
+				bool stop();
+				void run ();
+
+			private:
+
+				std::string pidfile;
+                int pidFH;
+
+			public:
+
+				int gracefulShutdownInterval; // in seconds
 
 		};
 #endif
 	}
 }
+
+#endif // DAEMON_H__

@@ -1,52 +1,29 @@
 #include <string.h>
 #include <fstream>
 #include <sstream>
-#include <boost/regex.hpp>
-#include <boost/filesystem.hpp>
-#include <boost/lexical_cast.hpp>
-#include <cryptopp/asn.h>
-#include <cryptopp/base64.h>
-#include <cryptopp/crc.h>
-#include <cryptopp/hmac.h>
-#include <cryptopp/zinflate.h>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp> 
+#include <boost/algorithm/string.hpp>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <zlib.h>
+
+#include "Crypto.h"
 #include "I2PEndian.h"
 #include "Reseed.h"
+#include "FS.h"
 #include "Log.h"
 #include "Identity.h"
-#include "CryptoConst.h"
 #include "NetDb.h"
+#include "HTTP.h"
 #include "util.h"
-
+#include "Config.h"
 
 namespace i2p
 {
 namespace data
 {
-
-	static std::vector<std::string> httpReseedHostList = {
-				// "http://193.150.121.66/netDb/",  // unstable
-				// "http://us.reseed.i2p2.no/",     // misconfigured, not serving reseed data
-				// "http://jp.reseed.i2p2.no/",     // Really outdated RIs
-				"http://netdb.i2p2.no/",            // only SU3 (v2) support
-				"http://i2p.mooo.com/netDb/",
-				"http://uk.reseed.i2p2.no/",
-				"http://i2p-netdb.innovatio.no/"
-			};
-
-	//TODO: Remember to add custom port support. Not all serves on 443
-	static std::vector<std::string> httpsReseedHostList = {
-				// "https://193.150.121.66/netDb/",  // unstable
-				// "https://i2p-netdb.innovatio.no/",// Vuln to POODLE
-				"https://netdb.i2p2.no/",            // Only SU3 (v2) support
-				"https://reseed.i2p-projekt.de/",    // Only HTTPS
-				"https://cowpuncher.drollette.com/netdb/",  // Only HTTPS and SU3 (v2) support -- will move to a new location
-				// following hosts are fine but don't support AES256 
-				/*"https://i2p.mooo.com/netDb/",
-				"https://link.mx24.eu/",             // Only HTTPS and SU3 (v2) support
-				"https://i2pseed.zarrenspry.info/",  // Only HTTPS and SU3 (v2) support
-				"https://ieb9oopo.mooo.com/"         // Only HTTPS and SU3 (v2) support*/
-			};
-	
+ 
 	Reseeder::Reseeder()
 	{
 	}
@@ -55,82 +32,77 @@ namespace data
 	{
 	}
 
-	bool Reseeder::reseedNow()
-	{
-		// This method is deprecated
-		try
-		{
-			std::string reseedHost = httpReseedHostList[(rand() % httpReseedHostList.size())];
-			LogPrint("Reseeding from ", reseedHost);
-			std::string content = i2p::util::http::httpRequest(reseedHost);
-			if (content == "")
-			{
-				LogPrint("Reseed failed");
-				return false;
-			}
-			boost::regex e("<\\s*A\\s+[^>]*href\\s*=\\s*\"([^\"]*)\"", boost::regex::normal | boost::regbase::icase);
-			boost::sregex_token_iterator i(content.begin(), content.end(), e, 1);
-			boost::sregex_token_iterator j;
-			//TODO: Ugly code, try to clean up.
-			//TODO: Try to reduce N number of variables
-			std::string name;
-			std::string routerInfo;
-			std::string tmpUrl;
-			std::string filename;
-			std::string ignoreFileSuffix = ".su3";
-			boost::filesystem::path root = i2p::util::filesystem::GetDataDir();
-			while (i != j)
-			{
-				name = *i++;
-				if (name.find(ignoreFileSuffix)!=std::string::npos)
-					continue;
-				LogPrint("Downloading ", name);
-				tmpUrl = reseedHost;
-				tmpUrl.append(name);
-				routerInfo = i2p::util::http::httpRequest(tmpUrl);
-				if (routerInfo.size()==0)
-					continue;
-				filename = root.string();
-#ifndef _WIN32
-				filename += "/netDb/r";
-#else
-				filename += "\\netDb\\r";
-#endif
-				filename += name.at(11); // first char in id
-#ifndef _WIN32
-				filename.append("/");
-#else
-				filename.append("\\");
-#endif
-				filename.append(name.c_str());
-				std::ofstream outfile (filename, std::ios::binary);
-				outfile << routerInfo;
-				outfile.close();
-			}
-			return true;
-		}
-		catch (std::exception& ex)
-		{
-			//TODO: error reporting
-			return false;
-		}
-		return false;
-	}	
+        /** @brief tries to bootstrap into I2P network (from local files and servers, with respect of options)
+         */
+        void Reseeder::Bootstrap ()
+        {
+            std::string su3FileName; i2p::config::GetOption("reseed.file", su3FileName);
+            std::string zipFileName; i2p::config::GetOption("reseed.zipfile", zipFileName);
 
-	int Reseeder::ReseedNowSU3 ()
+            if (su3FileName.length() > 0) // bootstrap from SU3 file or URL
+            {
+                int num;
+                if (su3FileName.length() > 8 && su3FileName.substr(0, 8) == "https://")
+                {
+                    num = ReseedFromSU3Url (su3FileName); // from https URL
+                }
+                else
+                {
+                    num = ProcessSU3File (su3FileName.c_str ());
+                }
+                if (num == 0)
+                    LogPrint (eLogWarning, "Reseed: failed to reseed from ", su3FileName);
+            }
+            else if (zipFileName.length() > 0) // bootstrap from ZIP file
+            {
+                int num = ProcessZIPFile (zipFileName.c_str ());
+                if (num == 0)
+                    LogPrint (eLogWarning, "Reseed: failed to reseed from ", zipFileName);
+            }
+            else // bootstrap from reseed servers
+            {
+                int num = ReseedFromServers ();
+                if (num == 0)
+                    LogPrint (eLogWarning, "Reseed: failed to reseed from servers");
+            }
+        }
+
+        /** @brief bootstrap from random server, retry 10 times
+         *  @return number of entries added to netDb
+         */
+	int Reseeder::ReseedFromServers ()
 	{
-		CryptoPP::AutoSeededRandomPool rnd;
-		auto ind = rnd.GenerateWord32 (0, httpReseedHostList.size() - 1 +  httpsReseedHostList.size () - 1);
-		std::string reseedHost = (ind < httpReseedHostList.size()) ? httpReseedHostList[ind] : 
-			httpsReseedHostList[ind - httpReseedHostList.size()]; 
-		return ReseedFromSU3 (reseedHost, ind >= httpReseedHostList.size());
+		std::string reseedURLs; i2p::config::GetOption("reseed.urls", reseedURLs);
+                std::vector<std::string> httpsReseedHostList;
+                boost::split(httpsReseedHostList, reseedURLs, boost::is_any_of(","), boost::token_compress_on);
+
+                if (reseedURLs.length () == 0)
+                {
+                    LogPrint (eLogWarning, "Reseed: No reseed servers specified");
+                    return 0;
+                }
+
+                int reseedRetries = 0;
+                while (reseedRetries < 10)
+                {
+                    auto ind = rand () % httpsReseedHostList.size ();
+                    std::string reseedUrl = httpsReseedHostList[ind] + "i2pseeds.su3";
+                    auto num = ReseedFromSU3Url (reseedUrl);
+                    if (num > 0) return num; // success
+                    reseedRetries++;
+                }
+                LogPrint (eLogWarning, "Reseed: failed to reseed from servers after 10 attempts");
+                return 0;
 	}
 
-	int Reseeder::ReseedFromSU3 (const std::string& host, bool https)
+        /** @brief bootstrap from HTTPS URL with SU3 file
+         *  @param url
+         *  @return number of entries added to netDb
+         */
+	int Reseeder::ReseedFromSU3Url (const std::string& url)
 	{
-		std::string url = host + "i2pseeds.su3";
-		LogPrint (eLogInfo, "Dowloading SU3 from ", host);
-		std::string su3 = https ? HttpsRequest (url) : i2p::util::http::httpRequest (url);
+		LogPrint (eLogInfo, "Reseed: Downloading SU3 from ", url);
+		std::string su3 = HttpsRequest (url);
 		if (su3.length () > 0)
 		{
 			std::stringstream s(su3);
@@ -138,7 +110,7 @@ namespace data
 		}
 		else
 		{
-			LogPrint (eLogWarning, "SU3 download failed");
+			LogPrint (eLogWarning, "Reseed: SU3 download failed");
 			return 0;
 		}
 	}
@@ -150,22 +122,36 @@ namespace data
 			return ProcessSU3Stream (s);
 		else
 		{
-			LogPrint (eLogError, "Can't open file ", filename);
+			LogPrint (eLogError, "Reseed: Can't open file ", filename);
 			return 0;
 		}
 	}
 
+	int Reseeder::ProcessZIPFile (const char * filename)
+	{
+		std::ifstream s(filename, std::ifstream::binary);
+		if (s.is_open ())	
+		{	
+			s.seekg (0, std::ios::end);
+			auto len = s.tellg ();
+			s.seekg (0, std::ios::beg);
+			return ProcessZIPStream (s, len);
+		}	
+		else
+		{
+			LogPrint (eLogError, "Reseed: Can't open file ", filename);
+			return 0;
+		}
+	}		
+	
 	const char SU3_MAGIC_NUMBER[]="I2Psu3";	
-	const uint32_t ZIP_HEADER_SIGNATURE = 0x04034B50;
-	const uint32_t ZIP_CENTRAL_DIRECTORY_HEADER_SIGNATURE = 0x02014B50;	
-	const uint16_t ZIP_BIT_FLAG_DATA_DESCRIPTOR = 0x0008;	
 	int Reseeder::ProcessSU3Stream (std::istream& s)
 	{
 		char magicNumber[7];
 		s.read (magicNumber, 7); // magic number and zero byte 6
 		if (strcmp (magicNumber, SU3_MAGIC_NUMBER))
 		{
-			LogPrint (eLogError, "Unexpected SU3 magic number");	
+			LogPrint (eLogError, "Reseed: Unexpected SU3 magic number");
 			return 0;
 		}			
 		s.seekg (1, std::ios::cur); // su3 file format version
@@ -189,7 +175,7 @@ namespace data
 		s.read ((char *)&fileType, 1);  // file type	
 		if (fileType != 0x00) //  zip file
 		{
-			LogPrint (eLogError, "Can't handle file type ", (int)fileType);	
+			LogPrint (eLogError, "Reseed: Can't handle file type ", (int)fileType);
 			return 0;
 		}
 		s.seekg (1, std::ios::cur); // unused
@@ -197,7 +183,7 @@ namespace data
 		s.read ((char *)&contentType, 1);  // content type	
 		if (contentType != 0x03) // reseed data
 		{
-			LogPrint (eLogError, "Unexpected content type ", (int)contentType);	
+			LogPrint (eLogError, "Reseed: Unexpected content type ", (int)contentType);
 			return 0;
 		}
 		s.seekg (12, std::ios::cur); // unused
@@ -207,36 +193,73 @@ namespace data
 		s.read (signerID, signerIDLength); // signerID
 		signerID[signerIDLength] = 0;
 		
-		//try to verify signature
-		auto it = m_SigningKeys.find (signerID);
-		if (it != m_SigningKeys.end ())
-		{
-			// TODO: implement all signature types
-			if (signatureType == SIGNING_KEY_TYPE_RSA_SHA512_4096)
+		bool verify; i2p::config::GetOption("reseed.verify", verify);
+		if (verify)
+		{ 
+			//try to verify signature
+			auto it = m_SigningKeys.find (signerID);
+			if (it != m_SigningKeys.end ())
 			{
-				size_t pos = s.tellg ();
-				size_t tbsLen = pos + contentLength;
-				uint8_t * tbs = new uint8_t[tbsLen];
-				s.seekg (0, std::ios::beg);
-				s.read ((char *)tbs, tbsLen);
-				uint8_t * signature = new uint8_t[signatureLength];
-				s.read ((char *)signature, signatureLength);
-				// RSA-raw
-				i2p::crypto::RSASHA5124096RawVerifier verifier(it->second);
-				verifier.Update (tbs, tbsLen);
-				if (!verifier.Verify (signature))
-					LogPrint (eLogWarning, "SU3 signature verification failed");
-				delete[] signature;
-				delete[] tbs;
-				s.seekg (pos, std::ios::beg);
+				// TODO: implement all signature types
+				if (signatureType == SIGNING_KEY_TYPE_RSA_SHA512_4096)
+				{
+					size_t pos = s.tellg ();
+					size_t tbsLen = pos + contentLength;
+					uint8_t * tbs = new uint8_t[tbsLen];
+					s.seekg (0, std::ios::beg);
+					s.read ((char *)tbs, tbsLen);
+					uint8_t * signature = new uint8_t[signatureLength];
+					s.read ((char *)signature, signatureLength);
+					// RSA-raw
+					{
+						// calculate digest
+						uint8_t digest[64];
+						SHA512 (tbs, tbsLen, digest);
+						// encrypt signature
+						BN_CTX * bnctx = BN_CTX_new ();
+						BIGNUM * s = BN_new (), * n = BN_new ();
+						BN_bin2bn (signature, signatureLength, s);
+						BN_bin2bn (it->second, i2p::crypto::RSASHA5124096_KEY_LENGTH, n);
+						BN_mod_exp (s, s, i2p::crypto::GetRSAE (), n, bnctx); // s = s^e mod n 
+						uint8_t * enSigBuf = new uint8_t[signatureLength];
+						i2p::crypto::bn2buf (s, enSigBuf, signatureLength);
+						// digest is right aligned
+						// we can't use RSA_verify due wrong padding in SU3
+						if (memcmp (enSigBuf + (signatureLength - 64), digest, 64))
+							LogPrint (eLogWarning, "Reseed: SU3 signature verification failed");
+						else
+							verify = false; // verified
+						delete[] enSigBuf;
+						BN_free (s); BN_free (n);
+						BN_CTX_free (bnctx);
+					}	
+					
+					delete[] signature;
+					delete[] tbs;
+					s.seekg (pos, std::ios::beg);
+				}
+				else
+					LogPrint (eLogWarning, "Reseed: Signature type ", signatureType, " is not supported");
 			}
 			else
-				LogPrint (eLogWarning, "Signature type ", signatureType, " is not supported");
+				LogPrint (eLogWarning, "Reseed: Certificate for ", signerID, " not loaded");
 		}
-		else
-			LogPrint (eLogWarning, "Certificate for ", signerID, " not loaded");
-		
+
+		if (verify) // not verified
+		{
+			LogPrint (eLogError, "Reseed: SU3 verification failed");
+			return 0;
+		}	
+
 		// handle content
+		return ProcessZIPStream (s, contentLength);
+	}
+
+	const uint32_t ZIP_HEADER_SIGNATURE = 0x04034B50;
+	const uint32_t ZIP_CENTRAL_DIRECTORY_HEADER_SIGNATURE = 0x02014B50;	
+	const uint16_t ZIP_BIT_FLAG_DATA_DESCRIPTOR = 0x0008;
+	int Reseeder::ProcessZIPStream (std::istream& s, uint64_t contentLength)
+	{	
 		int numFiles = 0;
 		size_t contentPos = s.tellg ();
 		while (!s.eof ())
@@ -256,8 +279,9 @@ namespace data
 				compressionMethod = le16toh (compressionMethod);
 				s.seekg (4, std::ios::cur); // skip fields we don't care about
 				uint32_t compressedSize, uncompressedSize; 
-				uint8_t crc32[4];
-				s.read ((char *)crc32, 4);	
+				uint32_t crc_32;
+				s.read ((char *)&crc_32, 4);
+				crc_32 = le32toh (crc_32);
 				s.read ((char *)&compressedSize, 4);	
 				compressedSize = le32toh (compressedSize);	
 				s.read ((char *)&uncompressedSize, 4);
@@ -265,6 +289,11 @@ namespace data
 				uint16_t fileNameLength, extraFieldLength; 
 				s.read ((char *)&fileNameLength, 2);	
 				fileNameLength = le16toh (fileNameLength);
+				if ( fileNameLength > 255 ) {
+					// too big
+					LogPrint(eLogError, "Reseed: SU3 fileNameLength too large: ", fileNameLength);
+					return numFiles;
+				}
 				s.read ((char *)&extraFieldLength, 2);
 				extraFieldLength = le16toh (extraFieldLength);
 				char localFileName[255];
@@ -277,11 +306,11 @@ namespace data
 					size_t pos = s.tellg ();
 					if (!FindZipDataDescriptor (s))
 					{
-						LogPrint (eLogError, "SU3 archive data descriptor not found");
+						LogPrint (eLogError, "Reseed: SU3 archive data descriptor not found");
 						return numFiles;
-					}								
-	
-					s.read ((char *)crc32, 4);	
+					}									
+					s.read ((char *)&crc_32, 4);	
+					crc_32 = le32toh (crc_32);
 					s.read ((char *)&compressedSize, 4);	
 					compressedSize = le32toh (compressedSize) + 4; // ??? we must consider signature as part of compressed data
 					s.read ((char *)&uncompressedSize, 4);
@@ -291,10 +320,10 @@ namespace data
 					s.seekg (pos, std::ios::beg); // back to compressed data
 				}
 
-				LogPrint (eLogDebug, "Proccessing file ", localFileName, " ", compressedSize, " bytes");
+				LogPrint (eLogDebug, "Reseed: Proccessing file ", localFileName, " ", compressedSize, " bytes");
 				if (!compressedSize)
 				{
-					LogPrint (eLogWarning, "Unexpected size 0. Skipped");
+					LogPrint (eLogWarning, "Reseed: Unexpected size 0. Skipped");
 					continue;
 				}	
 				
@@ -302,25 +331,31 @@ namespace data
 				s.read ((char *)compressed, compressedSize);
 				if (compressionMethod) // we assume Deflate
 				{
-					CryptoPP::Inflator decompressor;
-					decompressor.Put (compressed, compressedSize);	
-					decompressor.MessageEnd();
-					if (decompressor.MaxRetrievable () <= uncompressedSize)
-					{
-						uint8_t * uncompressed = new uint8_t[uncompressedSize];	
-						decompressor.Get (uncompressed, uncompressedSize);	
-						if (CryptoPP::CRC32().VerifyDigest (crc32, uncompressed, uncompressedSize))
+					z_stream inflator;
+					memset (&inflator, 0, sizeof (inflator));
+					inflateInit2 (&inflator, -MAX_WBITS); // no zlib header
+					uint8_t * uncompressed = new uint8_t[uncompressedSize];
+					inflator.next_in = compressed;
+					inflator.avail_in = compressedSize;
+					inflator.next_out = uncompressed;
+					inflator.avail_out = uncompressedSize; 
+					int err;
+					if ((err = inflate (&inflator, Z_SYNC_FLUSH)) >= 0)
+					{	
+						uncompressedSize -= inflator.avail_out;
+						if (crc32 (0, uncompressed, uncompressedSize) == crc_32)
 						{
 							i2p::data::netdb.AddRouterInfo (uncompressed, uncompressedSize);
 							numFiles++;
-						}
+						}	
 						else
-							LogPrint (eLogError, "CRC32 verification failed");
-						delete[] uncompressed;
-					}
+							LogPrint (eLogError, "Reseed: CRC32 verification failed");
+					}	
 					else
-						LogPrint (eLogError, "Actual uncompressed size ", decompressor.MaxRetrievable (), " exceed ", uncompressedSize, " from header");
-				}	
+						LogPrint (eLogError, "Reseed: SU3 decompression error ", err);
+					delete[] uncompressed;      
+					inflateEnd (&inflator);
+				}
 				else // no compression
 				{
 					i2p::data::netdb.AddRouterInfo (compressed, compressedSize);
@@ -333,12 +368,40 @@ namespace data
 			else
 			{
 				if (signature != ZIP_CENTRAL_DIRECTORY_HEADER_SIGNATURE)
-					LogPrint (eLogWarning, "Missing zip central directory header");
+					LogPrint (eLogWarning, "Reseed: Missing zip central directory header");
 				break; // no more files
 			}
 			size_t end = s.tellg ();
 			if (end - contentPos >= contentLength)
 				break; // we are beyond contentLength
+		}
+		if (numFiles) // check if  routers are not outdated
+		{
+			auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+			int numOutdated = 0;
+			i2p::data::netdb.VisitRouterInfos (
+				[&numOutdated, ts](std::shared_ptr<const RouterInfo> r)
+				{
+					if (r && ts > r->GetTimestamp () + 10*i2p::data::NETDB_MAX_EXPIRATION_TIMEOUT*1000LL) // 270 hours
+					{
+						LogPrint (eLogError, "Reseed: router ", r->GetIdentHash().ToBase64 (), " is outdated by ", (ts - r->GetTimestamp ())/1000LL/3600LL, " hours");
+						numOutdated++;
+					}
+				});
+			if (numOutdated > numFiles/2) // more than half
+			{
+				LogPrint (eLogError, "Reseed: mammoth's shit\n"
+				"	   *_____*\n"
+				"	  *_*****_*\n"
+				"	 *_(O)_(O)_*\n"
+				"	**____V____**\n"
+				"	**_________**\n"
+				"	**_________**\n"
+				"	 *_________*\n"
+				"	  ***___***");
+				i2p::data::netdb.ClearRouterInfos ();
+				numFiles = 0;
+			}
 		}
 		return numFiles;
 	}
@@ -363,462 +426,142 @@ namespace data
 		return false;
 	}
 
-	const char CERTIFICATE_HEADER[] = "-----BEGIN CERTIFICATE-----";
-	const char CERTIFICATE_FOOTER[] = "-----END CERTIFICATE-----";
 	void Reseeder::LoadCertificate (const std::string& filename)
 	{
-		std::ifstream s(filename, std::ifstream::binary);
-		if (s.is_open ())	
-		{
-			s.seekg (0, std::ios::end);
-			size_t len = s.tellg ();
-			s.seekg (0, std::ios::beg);
-			char buf[2048];
-			s.read (buf, len);
-			std::string cert (buf, len);
-			// assume file in pem format
-			auto pos1 = cert.find (CERTIFICATE_HEADER);	
-			auto pos2 = cert.find (CERTIFICATE_FOOTER);	
-			if (pos1 == std::string::npos || pos2 == std::string::npos)
-			{
-				LogPrint (eLogError, "Malformed certificate file");
-				return;
+		SSL_CTX * ctx = SSL_CTX_new (TLS_method ());
+		int ret = SSL_CTX_use_certificate_file (ctx, filename.c_str (), SSL_FILETYPE_PEM); 
+		if (ret)
+		{	
+			SSL * ssl = SSL_new (ctx);
+			X509 * cert = SSL_get_certificate (ssl);
+			// verify
+			if (cert)
+			{	
+				// extract issuer name
+				char name[100];
+				X509_NAME_oneline (X509_get_issuer_name(cert), name, 100);
+				char * cn = strstr (name, "CN=");
+				if (cn)
+				{	
+					cn += 3;
+					char * terminator = strchr (cn, '/');
+					if (terminator) terminator[0] = 0;
+				}	
+				// extract RSA key (we need n only, e = 65537)
+				RSA * key = EVP_PKEY_get0_RSA (X509_get_pubkey (cert));
+				const BIGNUM * n, * e, * d;
+				RSA_get0_key(key, &n, &e, &d);
+				PublicKey value;
+				i2p::crypto::bn2buf (n, value, 512);
+				if (cn)
+					m_SigningKeys[cn] = value;
+				else
+					LogPrint (eLogError, "Reseed: Can't find CN field in ", filename);
 			}	
-			pos1 += strlen (CERTIFICATE_HEADER);
-			pos2 -= pos1;
-			std::string base64 = cert.substr (pos1, pos2);
-
-			CryptoPP::ByteQueue queue;
-			CryptoPP::Base64Decoder decoder; // regular base64 rather than I2P 
-			decoder.Attach (new CryptoPP::Redirector (queue));
-			decoder.Put ((const uint8_t *)base64.data(), base64.length());
-			decoder.MessageEnd ();
-			
-			LoadCertificate (queue);
-		}
+			SSL_free (ssl);			
+		}	
 		else
-			LogPrint (eLogError, "Can't open certificate file ", filename);
+			LogPrint (eLogError, "Reseed: Can't open certificate file ", filename);
+		SSL_CTX_free (ctx);		
 	}
 
-	std::string Reseeder::LoadCertificate (CryptoPP::ByteQueue& queue)
-	{
-		// extract X.509
-		CryptoPP::BERSequenceDecoder x509Cert (queue);
-		CryptoPP::BERSequenceDecoder tbsCert (x509Cert);
-		// version
-		uint32_t ver;
-		CryptoPP::BERGeneralDecoder context (tbsCert, CryptoPP::CONTEXT_SPECIFIC | CryptoPP::CONSTRUCTED);
-		CryptoPP::BERDecodeUnsigned<uint32_t>(context, ver, CryptoPP::INTEGER);
-		// serial
-		CryptoPP::Integer serial;
-   		serial.BERDecode(tbsCert);	
-		// signature
-		CryptoPP::BERSequenceDecoder signature (tbsCert);
-   		signature.SkipAll();
-		
-		// issuer
-		std::string name;
-		CryptoPP::BERSequenceDecoder issuer (tbsCert);
-		{
-			CryptoPP::BERSetDecoder c (issuer);	c.SkipAll();
-			CryptoPP::BERSetDecoder st (issuer); st.SkipAll();
-			CryptoPP::BERSetDecoder l (issuer); l.SkipAll();
-			CryptoPP::BERSetDecoder o (issuer); o.SkipAll();
-			CryptoPP::BERSetDecoder ou (issuer); ou.SkipAll();
-			CryptoPP::BERSetDecoder cn (issuer);
-			{		
-				CryptoPP::BERSequenceDecoder attributes (cn);
-				{			
-					CryptoPP::BERGeneralDecoder ident(attributes, CryptoPP::OBJECT_IDENTIFIER);
-					ident.SkipAll ();
-					CryptoPP::BERDecodeTextString (attributes, name, CryptoPP::UTF8_STRING);
-				}	
-			}	
-		}	
-   		issuer.SkipAll();
-		// validity
-		CryptoPP::BERSequenceDecoder validity (tbsCert);
-   		validity.SkipAll();
-		// subject
-		CryptoPP::BERSequenceDecoder subject (tbsCert);
-   		subject.SkipAll();
-		// public key
-		CryptoPP::BERSequenceDecoder publicKey (tbsCert);
-		{			
-			CryptoPP::BERSequenceDecoder ident (publicKey);
-			ident.SkipAll ();
-			CryptoPP::BERGeneralDecoder key (publicKey, CryptoPP::BIT_STRING);
-			key.Skip (1); // FIXME: probably bug in crypto++
-			CryptoPP::BERSequenceDecoder keyPair (key);
-			CryptoPP::Integer n;
-   			n.BERDecode (keyPair);
-			if (name.length () > 0) 
-			{	
-				PublicKey value;
-				n.Encode (value, 512);
-				m_SigningKeys[name] = value;
-			}		
-			else
-				LogPrint (eLogWarning, "Unknown issuer. Skipped");
-		}	
-   		publicKey.SkipAll();
-		
-		tbsCert.SkipAll();
-		x509Cert.SkipAll();
-		return name;
-	}	
-	
 	void Reseeder::LoadCertificates ()
 	{
-		boost::filesystem::path reseedDir = i2p::util::filesystem::GetCertificatesDir() / "reseed";
-		
-		if (!boost::filesystem::exists (reseedDir))
-		{
-			LogPrint (eLogWarning, "Reseed certificates not loaded. ", reseedDir, " doesn't exist");
+		std::string certDir = i2p::fs::DataDirPath("certificates", "reseed");
+		std::vector<std::string> files;
+		int numCertificates = 0;
+
+		if (!i2p::fs::ReadDir(certDir, files)) {
+			LogPrint(eLogWarning, "Reseed: Can't load reseed certificates from ", certDir);
 			return;
 		}
 
-		int numCertificates = 0;
-		boost::filesystem::directory_iterator end; // empty
-		for (boost::filesystem::directory_iterator it (reseedDir); it != end; ++it)
-		{
-			if (boost::filesystem::is_regular_file (it->status()) && it->path ().extension () == ".crt")
-			{	
-				LoadCertificate (it->path ().string ());
-				numCertificates++;
-			}	
+		for (const std::string & file : files) {
+			if (file.compare(file.size() - 4, 4, ".crt") != 0) {
+				LogPrint(eLogWarning, "Reseed: ignoring file ", file);
+				continue;
+			}
+			LoadCertificate (file);
+			numCertificates++;
 		}	
-		LogPrint (eLogInfo, numCertificates, " certificates loaded");
+		LogPrint (eLogInfo, "Reseed: ", numCertificates, " certificates loaded");
 	}	
 
 	std::string Reseeder::HttpsRequest (const std::string& address)
 	{
-		i2p::util::http::url u(address);
-		TlsSession session (u.host_, 443);
-		
-		// send request		
-		std::stringstream ss;
-		ss << "GET " << u.path_ << " HTTP/1.1\r\nHost: " << u.host_
-		<< "\r\nAccept: */*\r\n" << "User-Agent: Wget/1.11.4\r\n" << "Connection: close\r\n\r\n";	
-		session.Send ((uint8_t *)ss.str ().c_str (), ss.str ().length ());
+		i2p::http::URL url;
+		if (!url.parse(address)) {
+			LogPrint(eLogError, "Reseed: failed to parse url: ", address);
+			return "";
+		}
+		url.schema = "https";
+		if (!url.port)
+			url.port = 443;
 
-		// read response
-		std::stringstream rs;
-		while (session.Receive (rs))
-			;
-		return i2p::util::http::GetHttpContent (rs);
-	}	
-
-	TlsSession::TlsSession (const std::string& host, int port):
-		m_Seqn (0)
-	{
-		m_Site.connect(host, boost::lexical_cast<std::string>(port));
-		if (m_Site.good ())
+		boost::asio::io_service service;
+		boost::system::error_code ecode;
+		auto it = boost::asio::ip::tcp::resolver(service).resolve (
+			boost::asio::ip::tcp::resolver::query (url.host, std::to_string(url.port)), ecode);
+		if (!ecode)
 		{
-			Handshake ();
+			boost::asio::ssl::context ctx(service, boost::asio::ssl::context::sslv23);
+			ctx.set_verify_mode(boost::asio::ssl::context::verify_none);
+			boost::asio::ssl::stream<boost::asio::ip::tcp::socket> s(service, ctx);
+			s.lowest_layer().connect (*it, ecode);
+			if (!ecode)
+			{
+				SSL_set_tlsext_host_name(s.native_handle(), url.host.c_str ());
+				s.handshake (boost::asio::ssl::stream_base::client, ecode);
+				if (!ecode)
+				{
+					LogPrint (eLogDebug, "Reseed: Connected to ", url.host, ":", url.port);
+					i2p::http::HTTPReq req;
+					req.uri = url.to_string();
+					req.AddHeader("User-Agent", "Wget/1.11.4");
+					req.AddHeader("Connection", "close");
+					s.write_some (boost::asio::buffer (req.to_string()));
+					// read response
+					std::stringstream rs;
+					char recv_buf[1024]; size_t l = 0;
+					do {
+						l = s.read_some (boost::asio::buffer (recv_buf, sizeof(recv_buf)), ecode);
+						if (l) rs.write (recv_buf, l);
+					} while (!ecode && l);
+					// process response
+					std::string data = rs.str();
+					i2p::http::HTTPRes res;
+					int len = res.parse(data);
+					if (len <= 0) {
+						LogPrint(eLogWarning, "Reseed: incomplete/broken response from ", url.host);
+						return "";
+					}
+					if (res.code != 200) {
+						LogPrint(eLogError, "Reseed: failed to reseed from ", url.host, ", http code ", res.code);
+						return "";
+					}
+					data.erase(0, len); /* drop http headers from response */
+					LogPrint(eLogDebug, "Reseed: got ", data.length(), " bytes of data from ", url.host);
+					if (res.is_chunked()) {
+						std::stringstream in(data), out;
+						if (!i2p::http::MergeChunkedResponse(in, out)) {
+							LogPrint(eLogWarning, "Reseed: failed to merge chunked response from ", url.host);
+							return "";
+						}
+						LogPrint(eLogDebug, "Reseed: got ", data.length(), "(", out.tellg(), ") bytes of data from ", url.host);
+						data = out.str();
+					}
+					return data;
+				}
+				else
+					LogPrint (eLogError, "Reseed: SSL handshake failed: ", ecode.message ());
+			}
+			else
+				LogPrint (eLogError, "Reseed: Couldn't connect to ", url.host, ": ", ecode.message ());
 		}
 		else
-			LogPrint (eLogError, "Can't connect to ", host, ":", port);
+			LogPrint (eLogError, "Reseed: Couldn't resolve address ", url.host, ": ", ecode.message ());
+		return "";
 	}	
-	
-	void TlsSession::Handshake ()
-	{
-		static uint8_t clientHello[] = 
-		{
-			0x16, // handshake
-			0x03, 0x03, // version (TLS 1.2)
-			0x00, 0x2F, // length of handshake
-			// handshake
-			0x01, // handshake type (client hello)
-			0x00, 0x00, 0x2B, // length of handshake payload 
-			// client hello
-			0x03, 0x03, // highest version supported (TLS 1.2)
-			0x45, 0xFA, 0x01, 0x19, 0x74, 0x55, 0x18, 0x36, 
-			0x42, 0x05, 0xC1, 0xDD, 0x4A, 0x21, 0x80, 0x80, 
-			0xEC, 0x37, 0x11, 0x93, 0x16, 0xF4, 0x66, 0x00, 
-			0x12, 0x67, 0xAB, 0xBA, 0xFF, 0x29, 0x13, 0x9E, // 32 random bytes
-			0x00, // session id length
-			0x00, 0x02, // chiper suites length
-			0x00, 0x3D, // RSA_WITH_AES_256_CBC_SHA256
-			0x01, // compression methods length
-			0x00,  // no compression
-			0x00, 0x00 // extensions length
-		};	
-
-		static uint8_t changeCipherSpecs[] =
-		{
-			0x14, // change cipher specs
-			0x03, 0x03, // version (TLS 1.2)
-			0x00, 0x01, // length
-			0x01 // type
-		};
-
-		static uint8_t finished[] =
-		{
-			0x16, // handshake
-			0x03, 0x03, // version (TLS 1.2)
-			0x00, 0x50, // length of handshake (80 bytes)
-			// handshake (encrypted)
-			// unencrypted context
-			//  0x14 handshake type (finished)
-			// 0x00, 0x00, 0x0C  length of handshake payload 
-			// 12 bytes of verified data
-		};
-	
-		// send ClientHello
-		m_Site.write ((char *)clientHello, sizeof (clientHello));
-		m_FinishedHash.Update (clientHello + 5, sizeof (clientHello) - 5);
-		// read ServerHello
-		uint8_t type;
-		m_Site.read ((char *)&type, 1); 
-		uint16_t version;
-		m_Site.read ((char *)&version, 2); 
-		uint16_t length;
-		m_Site.read ((char *)&length, 2); 
-		length = be16toh (length);
-		char * serverHello = new char[length];
-		m_Site.read (serverHello, length);
-		m_FinishedHash.Update ((uint8_t *)serverHello, length);
-		uint8_t serverRandom[32];
-		if (serverHello[0] == 0x02) // handshake type server hello
-			memcpy (serverRandom, serverHello + 6, 32);
-		else
-			LogPrint (eLogError, "Unexpected handshake type ", (int)serverHello[0]);
-		delete[] serverHello;
-		// read Certificate
-		m_Site.read ((char *)&type, 1); 
-		m_Site.read ((char *)&version, 2); 
-		m_Site.read ((char *)&length, 2); 
-		length = be16toh (length);
-		char * certificate = new char[length];
-		m_Site.read (certificate, length);
-		m_FinishedHash.Update ((uint8_t *)certificate, length);
-		CryptoPP::RSA::PublicKey publicKey;
-		// 0 - handshake type
-		// 1 - 3 - handshake payload length
-		// 4 - 6 - length of array of certificates
-		// 7 - 9 - length of certificate
-		if (certificate[0] == 0x0B) // handshake type certificate
-			publicKey = ExtractPublicKey ((uint8_t *)certificate + 10, length - 10);
-		else
-			LogPrint (eLogError, "Unexpected handshake type ", (int)certificate[0]);
-		delete[] certificate;
-		// read ServerHelloDone
-		m_Site.read ((char *)&type, 1); 
-		m_Site.read ((char *)&version, 2); 
-		m_Site.read ((char *)&length, 2); 
-		length = be16toh (length);
-		char * serverHelloDone = new char[length];
-		m_Site.read (serverHelloDone, length);
-		m_FinishedHash.Update ((uint8_t *)serverHelloDone, length);
-		if (serverHelloDone[0] != 0x0E) // handshake type hello done
-			LogPrint (eLogError, "Unexpected handshake type ", (int)serverHelloDone[0]);
-		delete[] serverHelloDone;
-		// our turn now
-		// generate secret key
-		uint8_t secret[48]; 
-		secret[0] = 3; secret[1] = 3; // version
-		m_Rnd.GenerateBlock (secret + 2, 46); // 46 random bytes
-		// encrypt RSA
- 		CryptoPP::RSAES_PKCS1v15_Encryptor encryptor(publicKey);
-		size_t encryptedLen = encryptor.CiphertextLength (48); // number of bytes for encrypted 48 bytes, usually 256 (2048 bits key)
-		uint8_t * encrypted = new uint8_t[encryptedLen + 2]; // + 2 bytes for length
-		htobe16buf (encrypted, encryptedLen); // first two bytes means length 
-		encryptor.Encrypt (m_Rnd, secret, 48, encrypted + 2);
-		// send ClientKeyExchange
-		// 0x10 - handshake type "client key exchange"
-		SendHandshakeMsg (0x10, encrypted, encryptedLen + 2);
-		delete[] encrypted;
-		// send ChangeCipherSpecs
-		m_Site.write ((char *)changeCipherSpecs, sizeof (changeCipherSpecs));
-		// calculate master secret
-		uint8_t masterSecret[48], random[64];
-		memcpy (random, clientHello + 11, 32);
-		memcpy (random + 32, serverRandom, 32);
-		PRF (secret, "master secret", random, 64, 48, masterSecret);
-		// expand master secret			
-		uint8_t keys[128]; // clientMACKey(32), serverMACKey(32), clientKey(32), serverKey(32)
-		memcpy (random, serverRandom, 32);
-		memcpy (random + 32, clientHello + 11, 32);
-		PRF (masterSecret, "key expansion", random, 64, 128, keys); 
-		memcpy (m_MacKey, keys, 32);
-		m_Encryption.SetKey (keys + 64);
-		m_Decryption.SetKey (keys + 96);
-
-		// send finished
-		uint8_t finishedHashDigest[32], finishedPayload[40], encryptedPayload[80];
-		finishedPayload[0] = 0x14; // handshake type (finished)
-		finishedPayload[1] = 0; finishedPayload[2] = 0; finishedPayload[3] = 0x0C; // 12 bytes
-		m_FinishedHash.Final (finishedHashDigest);
-		PRF (masterSecret, "client finished", finishedHashDigest, 32, 12, finishedPayload + 4);
-		uint8_t mac[32];
-		CalculateMAC (0x16, finishedPayload, 16, mac);
-		Encrypt (finishedPayload, 16, mac, encryptedPayload);
-		m_Site.write ((char *)finished, sizeof (finished));
-		m_Site.write ((char *)encryptedPayload, 80);
-		// read ChangeCipherSpecs
-		uint8_t changeCipherSpecs1[6];
-		m_Site.read ((char *)changeCipherSpecs1, 6);
-		// read finished
-		m_Site.read ((char *)&type, 1); 
-		m_Site.read ((char *)&version, 2); 
-		m_Site.read ((char *)&length, 2); 
-		length = be16toh (length);
-		char * finished1 = new char[length];
-		m_Site.read (finished1, length);
-		delete[] finished1;
-	}
-
-	void TlsSession::SendHandshakeMsg (uint8_t handshakeType, uint8_t * data, size_t len)
-	{
-		uint8_t handshakeHeader[9];
-		handshakeHeader[0] = 0x16; // handshake
- 		handshakeHeader[1] = 0x03; handshakeHeader[2] = 0x03; // version is always TLS 1.2 (3,3) 
-		htobe16buf (handshakeHeader + 3, len + 4); // length of payload
-		//payload starts
-		handshakeHeader[5] = handshakeType; // handshake type
-		handshakeHeader[6] = 0; // highest byte of payload length is always zero
-		htobe16buf (handshakeHeader + 7, len); // length of data
-		m_Site.write ((char *)handshakeHeader, 9);
-		m_FinishedHash.Update (handshakeHeader + 5, 4); // only payload counts
-		m_Site.write ((char *)data, len);
-		m_FinishedHash.Update (data, len);
-	}
-
-	void TlsSession::PRF (const uint8_t * secret, const char * label, const uint8_t * random, size_t randomLen,
-		size_t len, uint8_t * buf)
-	{
-		// secret is assumed 48 bytes	
-		// random is not more than 64 bytes
- 		CryptoPP::HMAC<CryptoPP::SHA256> hmac (secret, 48);	
-		uint8_t seed[96]; size_t seedLen;
-		seedLen = strlen (label);	
-		memcpy (seed, label, seedLen);
-		memcpy (seed + seedLen, random, randomLen);
-		seedLen += randomLen;
-
-		size_t offset = 0;
-		uint8_t a[128];
-		hmac.CalculateDigest (a, seed, seedLen);
-		while (offset < len)
-		{
-			memcpy (a + 32, seed, seedLen);
-			hmac.CalculateDigest (buf + offset, a, seedLen + 32);
-			offset += 32;
-			hmac.CalculateDigest (a, a, 32);
-		}
-	}
-
-	size_t TlsSession::Encrypt (const uint8_t * in, size_t len, const uint8_t * mac, uint8_t * out)
-	{
-		size_t size = 0;
-		m_Rnd.GenerateBlock (out, 16); // iv
-		size += 16;
-		m_Encryption.SetIV (out);
-		memcpy (out + size, in, len);
-		size += len;
-		memcpy (out + size, mac, 32);
-		size += 32;	
-		uint8_t paddingSize = len + 1;
-		paddingSize &= 0x0F;  // %16
-		if (paddingSize > 0) paddingSize = 16 - paddingSize;
-		memset (out + size, paddingSize, paddingSize + 1); // paddind and last byte are equal to padding size
-		size += paddingSize + 1;
-		m_Encryption.Encrypt (out + 16, size - 16, out + 16);
-		return size;	
-	}
-
-	size_t TlsSession::Decrypt (uint8_t * buf, size_t len)
-	{
-		m_Decryption.SetIV (buf);
-		m_Decryption.Decrypt (buf + 16, len - 16, buf + 16);
-		return len - 48 - buf[len -1] - 1; // IV(16), mac(32) and padding
-	}
-
-	void TlsSession::CalculateMAC (uint8_t type, const uint8_t * buf, size_t len, uint8_t * mac)
-	{
-		uint8_t header[13]; // seqn (8) + type (1) + version (2) + length (2)
-		htobe64buf (header, m_Seqn);
-		header[8] = type; header[9] = 3; header[10] = 3; // 3,3 means TLS 1.2 
-		htobe16buf (header + 11, len);
-		CryptoPP::HMAC<CryptoPP::SHA256> hmac (m_MacKey, 32);	
-		hmac.Update (header, 13);
-		hmac.Update (buf, len);
-		hmac.Final (mac);	
-		m_Seqn++;
-	}
-
-	CryptoPP::RSA::PublicKey TlsSession::ExtractPublicKey (const uint8_t * certificate, size_t len)
-	{
-		CryptoPP::ByteQueue queue;
-		queue.Put (certificate, len);	
-		queue.MessageEnd ();
-		// extract X.509
-		CryptoPP::BERSequenceDecoder x509Cert (queue);
-		CryptoPP::BERSequenceDecoder tbsCert (x509Cert);
-		// version
-		uint32_t ver;
-		CryptoPP::BERGeneralDecoder context (tbsCert, CryptoPP::CONTEXT_SPECIFIC | CryptoPP::CONSTRUCTED);
-		CryptoPP::BERDecodeUnsigned<uint32_t>(context, ver, CryptoPP::INTEGER);
-		// serial
-		CryptoPP::Integer serial;
-   		serial.BERDecode(tbsCert);	
-		// signature
-		CryptoPP::BERSequenceDecoder signature (tbsCert);
-   		signature.SkipAll();
-		// issuer
-		CryptoPP::BERSequenceDecoder issuer (tbsCert);
-   		issuer.SkipAll();
-		// validity
-		CryptoPP::BERSequenceDecoder validity (tbsCert);
-   		validity.SkipAll();
-		// subject
-		CryptoPP::BERSequenceDecoder subject (tbsCert);
-   		subject.SkipAll();
-		// public key
-		CryptoPP::BERSequenceDecoder publicKey (tbsCert);			
-		CryptoPP::BERSequenceDecoder ident (publicKey);
-		ident.SkipAll ();
-		CryptoPP::BERGeneralDecoder key (publicKey, CryptoPP::BIT_STRING);
-		key.Skip (1); // FIXME: probably bug in crypto++
-		CryptoPP::BERSequenceDecoder keyPair (key);
-		CryptoPP::Integer n, e;
-		n.BERDecode (keyPair);
-		e.BERDecode (keyPair);
-
-		CryptoPP::RSA::PublicKey ret; 
-		ret.Initialize (n, e);
-		return ret;
-	}		
-
-	void TlsSession::Send (const uint8_t * buf, size_t len)
-	{
-		uint8_t * out = new uint8_t[len + 64 + 5]; // 64 = 32 mac + 16 iv + upto 16 padding, 5 = header
-		out[0] = 0x17; // application data
-		out[1] = 0x03; out[2] = 0x03; // version
-		uint8_t mac[32];
-		CalculateMAC (0x17, buf, len, mac);
-		size_t encryptedLen = Encrypt (buf, len, mac, out + 5);
-		htobe16buf (out + 3, encryptedLen);
-		m_Site.write ((char *)out, encryptedLen + 5);
-		delete[] out;
-	}
-
-	bool TlsSession::Receive (std::ostream& rs)
-	{
-		if (m_Site.eof ()) return false;
-		uint8_t type; uint16_t version, length;
-		m_Site.read ((char *)&type, 1); 
-		m_Site.read ((char *)&version, 2); 
-		m_Site.read ((char *)&length, 2); 
-		length = be16toh (length);
-		uint8_t * buf = new uint8_t[length];
-		m_Site.read ((char *)buf, length);
-		size_t decryptedLen = Decrypt (buf, length);
-		rs.write ((char *)buf + 16, decryptedLen);
-		delete[] buf;
-		return true;
-	}
 }
 }
 

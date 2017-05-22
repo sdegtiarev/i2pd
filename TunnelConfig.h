@@ -5,8 +5,8 @@
 #include <sstream>
 #include <vector>
 #include <memory>
-#include "aes.h"
-#include "RouterInfo.h"
+#include "Crypto.h"
+#include "Identity.h"
 #include "RouterContext.h"
 #include "Timestamp.h"
 
@@ -16,7 +16,8 @@ namespace tunnel
 {
 	struct TunnelHopConfig
 	{
-		std::shared_ptr<const i2p::data::RouterInfo> router, nextRouter;
+		std::shared_ptr<const i2p::data::IdentityEx> ident;
+		i2p::data::IdentHash nextIdent;
 		uint32_t tunnelID, nextTunnelID;
 		uint8_t layerKey[32];
 		uint8_t ivKey[32];
@@ -25,19 +26,18 @@ namespace tunnel
 		bool isGateway, isEndpoint;	
 		
 		TunnelHopConfig * next, * prev;
-		i2p::crypto::TunnelDecryption decryption;	
 		int recordIndex; // record # in tunnel build message
 		
-		TunnelHopConfig (std::shared_ptr<const i2p::data::RouterInfo> r)
+		TunnelHopConfig (std::shared_ptr<const i2p::data::IdentityEx> r)
 		{
-			CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
-			rnd.GenerateBlock (layerKey, 32);
-			rnd.GenerateBlock (ivKey, 32);
-			rnd.GenerateBlock (replyIV, 16);
-			tunnelID = rnd.GenerateWord32 ();
+			RAND_bytes (layerKey, 32);
+			RAND_bytes (ivKey, 32);
+			RAND_bytes (replyKey, 32);
+			RAND_bytes (replyIV, 16);
+			RAND_bytes ((uint8_t *)&tunnelID, 4);
 			isGateway = true;
 			isEndpoint = true;
-			router = r; 
+			ident = r; 
 			//nextRouter = nullptr; 
 			nextTunnelID = 0;
 
@@ -45,18 +45,17 @@ namespace tunnel
 			prev = nullptr;
 		}	
 
-		void SetNextRouter (std::shared_ptr<const i2p::data::RouterInfo> r)
+		void SetNextIdent (const i2p::data::IdentHash& ident)
 		{
-			nextRouter = r;
+			nextIdent = ident;
 			isEndpoint = false;
-			CryptoPP::RandomNumberGenerator& rnd = i2p::context.GetRandomNumberGenerator ();
-			nextTunnelID = rnd.GenerateWord32 ();
+			RAND_bytes ((uint8_t *)&nextTunnelID, 4);
 		}	
 
-		void SetReplyHop (const TunnelHopConfig * replyFirstHop)
+		void SetReplyHop (uint32_t replyTunnelID, const i2p::data::IdentHash& replyIdent)
 		{
-			nextRouter = replyFirstHop->router;
-			nextTunnelID = replyFirstHop->tunnelID;
+			nextIdent = replyIdent;
+			nextTunnelID = replyTunnelID;
 			isEndpoint = true;
 		}
 		
@@ -68,7 +67,7 @@ namespace tunnel
 				next->prev = this;
 				next->isGateway = false;
 				isEndpoint = false;
-				nextRouter = next->router;
+				nextIdent = next->ident->GetIdentHash ();
 				nextTunnelID = next->tunnelID;
 			}	
 		}
@@ -84,13 +83,13 @@ namespace tunnel
 			}	
 		}
 
-		void CreateBuildRequestRecord (uint8_t * record, uint32_t replyMsgID)
+		void CreateBuildRequestRecord (uint8_t * record, uint32_t replyMsgID, BN_CTX * ctx) const
 		{
 			uint8_t clearText[BUILD_REQUEST_RECORD_CLEAR_TEXT_SIZE];
 			htobe32buf (clearText + BUILD_REQUEST_RECORD_RECEIVE_TUNNEL_OFFSET, tunnelID); 
-			memcpy (clearText + BUILD_REQUEST_RECORD_OUR_IDENT_OFFSET, router->GetIdentHash (), 32);
+			memcpy (clearText + BUILD_REQUEST_RECORD_OUR_IDENT_OFFSET, ident->GetIdentHash (), 32);
 			htobe32buf (clearText + BUILD_REQUEST_RECORD_NEXT_TUNNEL_OFFSET, nextTunnelID);
-			memcpy (clearText + BUILD_REQUEST_RECORD_NEXT_IDENT_OFFSET, nextRouter->GetIdentHash (), 32);
+			memcpy (clearText + BUILD_REQUEST_RECORD_NEXT_IDENT_OFFSET, nextIdent, 32);
 			memcpy (clearText + BUILD_REQUEST_RECORD_LAYER_KEY_OFFSET, layerKey, 32);
 			memcpy (clearText + BUILD_REQUEST_RECORD_IV_KEY_OFFSET, ivKey, 32);
 			memcpy (clearText + BUILD_REQUEST_RECORD_REPLY_KEY_OFFSET, replyKey, 32);
@@ -101,9 +100,9 @@ namespace tunnel
 			clearText[BUILD_REQUEST_RECORD_FLAG_OFFSET] = flag;
 			htobe32buf (clearText + BUILD_REQUEST_RECORD_REQUEST_TIME_OFFSET, i2p::util::GetHoursSinceEpoch ()); 
 			htobe32buf (clearText + BUILD_REQUEST_RECORD_SEND_MSG_ID_OFFSET, replyMsgID); 
-			// TODO: fill padding
-			router->GetElGamalEncryption ()->Encrypt (clearText, BUILD_REQUEST_RECORD_CLEAR_TEXT_SIZE, record + BUILD_REQUEST_RECORD_ENCRYPTED_OFFSET);
-			memcpy (record + BUILD_REQUEST_RECORD_TO_PEER_OFFSET, (const uint8_t *)router->GetIdentHash (), 16);
+			RAND_bytes (clearText + BUILD_REQUEST_RECORD_PADDING_OFFSET, BUILD_REQUEST_RECORD_CLEAR_TEXT_SIZE - BUILD_REQUEST_RECORD_PADDING_OFFSET);
+			i2p::crypto::ElGamalEncrypt (ident->GetEncryptionPublicKey (), clearText, record + BUILD_REQUEST_RECORD_ENCRYPTED_OFFSET, ctx);
+			memcpy (record + BUILD_REQUEST_RECORD_TO_PEER_OFFSET, (const uint8_t *)ident->GetIdentHash (), 16);
 		}	
 	};	
 
@@ -111,29 +110,18 @@ namespace tunnel
 	{
 		public:			
 			
-
-			TunnelConfig (std::vector<std::shared_ptr<const i2p::data::RouterInfo> > peers, 
-				const TunnelConfig * replyTunnelConfig = nullptr) // replyTunnelConfig=nullptr means inbound
+			TunnelConfig (std::vector<std::shared_ptr<const i2p::data::IdentityEx> > peers) // inbound
 			{
-				TunnelHopConfig * prev = nullptr;
-				for (auto it: peers)
-				{
-					auto hop = new TunnelHopConfig (it);
-					if (prev)
-						prev->SetNext (hop);
-					else	
-						m_FirstHop = hop;
-					prev = hop;
-				}	
-				m_LastHop = prev;
-				
-				if (replyTunnelConfig) // outbound
-				{
-					m_FirstHop->isGateway = false;
-					m_LastHop->SetReplyHop (replyTunnelConfig->GetFirstHop ());
-				}	
-				else // inbound
-					m_LastHop->SetNextRouter (i2p::context.GetSharedRouterInfo ());
+				CreatePeers (peers);
+				m_LastHop->SetNextIdent (i2p::context.GetIdentHash ());
+			}
+
+			TunnelConfig (std::vector<std::shared_ptr<const i2p::data::IdentityEx> > peers, 
+				uint32_t replyTunnelID, const i2p::data::IdentHash& replyIdent) // outbound
+			{
+				CreatePeers (peers);
+				m_FirstHop->isGateway = false;
+				m_LastHop->SetReplyHop (replyTunnelID, replyIdent);
 			}
 			
 			~TunnelConfig ()
@@ -170,75 +158,93 @@ namespace tunnel
 				return num;
 			}
 
-			void Print (std::stringstream& s) const
+			bool IsEmpty () const
 			{
-				TunnelHopConfig * hop = m_FirstHop;
-				if (!m_FirstHop->isGateway)
-					s << "me";
-				s << "-->" << m_FirstHop->tunnelID;
-				while (hop)
-				{
-					s << ":" << hop->router->GetIdentHashAbbreviation () << "-->"; 
-					if (!hop->isEndpoint)
-						s << hop->nextTunnelID;
-					else
-						return;
-					hop = hop->next;
-				}	
-				// we didn't reach enpoint that mean we are last hop
-				s << ":me";	
+				return !m_FirstHop;
+			}			
+
+			virtual bool IsInbound () const { return m_FirstHop->isGateway; }
+
+			virtual uint32_t GetTunnelID () const 
+			{	
+				if (!m_FirstHop) return 0;
+				return IsInbound () ? m_LastHop->nextTunnelID : m_FirstHop->tunnelID; 
 			}
 
-			TunnelConfig * Invert () const
-			{
-				TunnelConfig * newConfig = new TunnelConfig ();
-				TunnelHopConfig * hop = m_FirstHop, * nextNewHop = nullptr;
-				while (hop)
-				{
-					TunnelHopConfig * newHop = new TunnelHopConfig (hop->router);
-					if (nextNewHop)
-						newHop->SetNext (nextNewHop);
-					nextNewHop = newHop;
-					newHop->isEndpoint = hop->isGateway;
-					newHop->isGateway = hop->isEndpoint;
-					
-					if (!hop->prev) // first hop
-					{	
-						newConfig->m_LastHop = newHop; 
-						if (hop->isGateway) // inbound tunnel
-							newHop->SetReplyHop (m_FirstHop); // use it as reply tunnel
-						else
-							newHop->SetNextRouter (i2p::context.GetSharedRouterInfo ());
-					}	
-					if (!hop->next) newConfig->m_FirstHop = newHop; // last hop
-									
-					hop = hop->next;
-				}	
-				return newConfig;
+			virtual uint32_t GetNextTunnelID () const 
+			{	
+				if (!m_FirstHop) return 0;
+				return m_FirstHop->tunnelID; 
 			}
 
-			TunnelConfig * Clone (const TunnelConfig * replyTunnelConfig = nullptr) const
-			{
-				std::vector<std::shared_ptr<const i2p::data::RouterInfo> > peers;
-				TunnelHopConfig * hop = m_FirstHop;
-				while (hop)
-				{
-					peers.push_back (hop->router);
-					hop = hop->next;
-				}	
-				return new TunnelConfig (peers, replyTunnelConfig);
+			virtual const i2p::data::IdentHash& GetNextIdentHash () const 
+			{ 
+				return m_FirstHop->ident->GetIdentHash (); 
+			}	
+
+			virtual const i2p::data::IdentHash& GetLastIdentHash () const 
+			{ 
+				return m_LastHop->ident->GetIdentHash (); 
 			}	
 			
-		private:
+			std::vector<std::shared_ptr<const i2p::data::IdentityEx> > GetPeers () const
+			{
+				std::vector<std::shared_ptr<const i2p::data::IdentityEx> > peers;
+				TunnelHopConfig * hop = m_FirstHop;		
+				while (hop)
+				{
+					peers.push_back (hop->ident);
+					hop = hop->next;
+				}	
+				return peers;
+			}
+			
+		protected:
 
 			// this constructor can't be called from outside
 			TunnelConfig (): m_FirstHop (nullptr), m_LastHop (nullptr)
 			{
 			}
+	
+		private:
+
+			template<class Peers>
+			void CreatePeers (const Peers& peers)
+			{
+				TunnelHopConfig * prev = nullptr;
+				for (const auto& it: peers)
+				{
+					auto hop = new TunnelHopConfig (it);
+					if (prev)
+						prev->SetNext (hop);
+					else	
+						m_FirstHop = hop;
+					prev = hop;
+				}	
+				m_LastHop = prev;
+			}
 			
 		private:
 
 			TunnelHopConfig * m_FirstHop, * m_LastHop;
+	};
+
+	class ZeroHopsTunnelConfig: public TunnelConfig
+	{
+		public:
+
+			ZeroHopsTunnelConfig () { RAND_bytes ((uint8_t *)&m_TunnelID, 4);};
+
+			bool IsInbound () const { return true; }; // TODO:		
+			uint32_t GetTunnelID () const { return m_TunnelID; };
+			uint32_t GetNextTunnelID () const { return m_TunnelID; };
+			const i2p::data::IdentHash& GetNextIdentHash () const { return i2p::context.GetIdentHash (); };
+			const i2p::data::IdentHash& GetLastIdentHash () const { return i2p::context.GetIdentHash (); };
+
+
+		private:
+		
+			uint32_t m_TunnelID;	
 	};	
 }		
 }	

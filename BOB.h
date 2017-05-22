@@ -36,6 +36,7 @@ namespace client
 	const char BOB_COMMAND_CLEAR[] = "clear";
 	const char BOB_COMMAND_LIST[] = "list";
 	const char BOB_COMMAND_OPTION[] = "option";
+	const char BOB_COMMAND_STATUS[] = "status";	
 	
 	const char BOB_VERSION[] = "BOB 00.00.10\nOK\n";	
 	const char BOB_REPLY_OK[] = "OK %s\n";
@@ -57,9 +58,9 @@ namespace client
 	{
 			struct AddressReceiver
 			{
-				boost::asio::ip::tcp::socket * socket;
+				std::shared_ptr<boost::asio::ip::tcp::socket> socket;
 				char buffer[BOB_COMMAND_BUFFER_SIZE + 1]; // for destination base64 address
-				uint8_t * data; 
+				uint8_t * data; // pointer to buffer
 				size_t dataLen, bufferOffset; 
 
 				AddressReceiver (): data (nullptr), dataLen (0), bufferOffset (0) {};
@@ -76,15 +77,15 @@ namespace client
 		private:
 
 			void Accept ();
-			void HandleAccept (const boost::system::error_code& ecode, AddressReceiver * receiver);
+			void HandleAccept (const boost::system::error_code& ecode, std::shared_ptr<AddressReceiver> receiver);
 
-			void ReceiveAddress (AddressReceiver * receiver);
+			void ReceiveAddress (std::shared_ptr<AddressReceiver> receiver);
 			void HandleReceivedAddress (const boost::system::error_code& ecode, std::size_t bytes_transferred,
-				AddressReceiver * receiver);
+				std::shared_ptr<AddressReceiver> receiver);
 
-			void HandleDestinationRequestComplete (bool success, AddressReceiver * receiver, i2p::data::IdentHash ident);
+			void HandleDestinationRequestComplete (std::shared_ptr<i2p::data::LeaseSet> leaseSet, std::shared_ptr<AddressReceiver> receiver);
 
-			void CreateConnection (AddressReceiver * receiver, std::shared_ptr<const i2p::data::LeaseSet> leaseSet);
+			void CreateConnection (std::shared_ptr<AddressReceiver> receiver, std::shared_ptr<const i2p::data::LeaseSet> leaseSet);
 
 		private:
 
@@ -127,6 +128,7 @@ namespace client
 			void CreateInboundTunnel (int port);
 			void CreateOutboundTunnel (const std::string& address, int port, bool quiet);
 			const i2p::data::PrivateKeys& GetKeys () const { return m_LocalDestination->GetPrivateKeys (); };
+			std::shared_ptr<ClientDestination> GetLocalDestination () const { return m_LocalDestination; };
 			
 		private:	
 
@@ -167,6 +169,7 @@ namespace client
 			void ClearCommandHandler (const char * operand, size_t len);
 			void ListCommandHandler (const char * operand, size_t len);
 			void OptionCommandHandler (const char * operand, size_t len);
+			void StatusCommandHandler (const char * operand, size_t len);
 			
 		private:
 
@@ -185,7 +188,7 @@ namespace client
 			boost::asio::ip::tcp::socket m_Socket;
 			char m_ReceiveBuffer[BOB_COMMAND_BUFFER_SIZE + 1], m_SendBuffer[BOB_COMMAND_BUFFER_SIZE + 1];
 			size_t m_ReceiveBufferOffset;
-			bool m_IsOpen, m_IsQuiet;
+			bool m_IsOpen, m_IsQuiet, m_IsActive;
 			std::string m_Nickname, m_Address;
 			int m_InPort, m_OutPort;
 			i2p::data::PrivateKeys m_Keys;
@@ -198,7 +201,7 @@ namespace client
 	{
 		public:
 
-			BOBCommandChannel (int port);
+			BOBCommandChannel (const std::string& address, int port);
 			~BOBCommandChannel ();
 
 			void Start ();

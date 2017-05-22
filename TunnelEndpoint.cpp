@@ -1,10 +1,12 @@
 #include "I2PEndian.h"
 #include <string.h>
+#include "Crypto.h"
 #include "Log.h"
 #include "NetDb.h"
 #include "I2NPProtocol.h"
 #include "Transports.h"
 #include "RouterContext.h"
+#include "Timestamp.h"
 #include "TunnelEndpoint.h"
 
 namespace i2p
@@ -13,13 +15,9 @@ namespace tunnel
 {
 	TunnelEndpoint::~TunnelEndpoint ()
 	{
-		for (auto it: m_IncompleteMessages)
-			i2p::DeleteI2NPMessage (it.second.data);
-		for (auto it: m_OutOfSequenceFragments)
-			i2p::DeleteI2NPMessage (it.second.data);
 	}	
 	
-	void TunnelEndpoint::HandleDecryptedTunnelDataMsg (I2NPMessage * msg)
+	void TunnelEndpoint::HandleDecryptedTunnelDataMsg (std::shared_ptr<I2NPMessage> msg)
 	{
 		m_NumReceivedBytes += TUNNEL_DATA_MSG_SIZE;
 		
@@ -31,11 +29,10 @@ namespace tunnel
 			// verify checksum
 			memcpy (msg->GetPayload () + TUNNEL_DATA_MSG_SIZE, msg->GetPayload () + 4, 16); // copy iv to the end
 			uint8_t hash[32];
-			CryptoPP::SHA256().CalculateDigest (hash, fragment, TUNNEL_DATA_MSG_SIZE -(fragment - msg->GetPayload ()) + 16); // payload + iv
+			SHA256(fragment, TUNNEL_DATA_MSG_SIZE -(fragment - msg->GetPayload ()) + 16, hash); // payload + iv
 			if (memcmp (hash, decrypted, 4))
 			{
 				LogPrint (eLogError, "TunnelMessage: checksum verification failed");
-				i2p::DeleteI2NPMessage (msg);
 				return;
 			}	
 			// process fragments
@@ -94,10 +91,15 @@ namespace tunnel
 
 				msg->offset = fragment - msg->buf;
 				msg->len = msg->offset + size;
+				if (msg->len > msg->maxLen)
+				{
+					LogPrint (eLogError, "TunnelMessage: fragment is too long ", (int)size);
+					return;
+				}
 				if (fragment + size < decrypted + TUNNEL_DATA_ENCRYPTED_SIZE)
 				{
 					// this is not last message. we have to copy it
-					m.data = NewI2NPShortMessage ();
+					m.data = NewI2NPTunnelMessage ();
 					m.data->offset += TUNNEL_GATEWAY_HEADER_SIZE; // reserve room for TunnelGateway header
 					m.data->len += TUNNEL_GATEWAY_HEADER_SIZE;
 					*(m.data) = *msg;
@@ -114,14 +116,12 @@ namespace tunnel
 						if (!isFollowOnFragment) // create new incomlete message
 						{
 							m.nextFragmentNum = 1;
+							m.receiveTime = i2p::util::GetMillisecondsSinceEpoch ();
 							auto ret = m_IncompleteMessages.insert (std::pair<uint32_t, TunnelMessageBlockEx>(msgID, m));
 							if (ret.second)
-								HandleOutOfSequenceFragment (msgID, ret.first->second);
+								HandleOutOfSequenceFragments (msgID, ret.first->second);
 							else
-							{
-								LogPrint (eLogError, "Incomplete message ", msgID, "already exists");
-								DeleteI2NPMessage (m.data);
-							}	
+								LogPrint (eLogError, "TunnelMessage: Incomplete message ", msgID, " already exists");
 						}
 						else
 						{
@@ -130,20 +130,14 @@ namespace tunnel
 						}	
 					}
 					else	
-					{	
-						LogPrint (eLogError, "Message is fragmented, but msgID is not presented");
-						DeleteI2NPMessage (m.data);
-					}	
+						LogPrint (eLogError, "TunnelMessage: Message is fragmented, but msgID is not presented");
 				}	
 					
 				fragment += size;
 			}	
 		}	
 		else
-		{	
 			LogPrint (eLogError, "TunnelMessage: zero not found");
-			i2p::DeleteI2NPMessage (msg);	
-		}	
 	}	
 
 	void TunnelEndpoint::HandleFollowOnFragment (uint32_t msgID, bool isLastFragment, const TunnelMessageBlockEx& m)
@@ -160,14 +154,13 @@ namespace tunnel
 				{	
 					if (msg.data->len + size > msg.data->maxLen)
 					{
-						LogPrint (eLogInfo, "Tunnel endpoint I2NP message size ", msg.data->maxLen, " is not enough");
-						I2NPMessage * newMsg = NewI2NPMessage ();
+					//	LogPrint (eLogWarning, "TunnelMessage: I2NP message size ", msg.data->maxLen, " is not enough");
+						auto newMsg = NewI2NPMessage ();
 						*newMsg = *(msg.data);
-						DeleteI2NPMessage (msg.data);
 						msg.data = newMsg;
 					}
-					memcpy (msg.data->buf + msg.data->len, fragment, size); // concatenate fragment
-					msg.data->len += size;
+					if (msg.data->Concat (fragment, size) < size) // concatenate fragment
+						LogPrint (eLogError, "TunnelMessage: I2NP buffer overflow ", msg.data->maxLen);
 					if (isLastFragment)
 					{
 						// message complete
@@ -177,114 +170,129 @@ namespace tunnel
 					else
 					{	
 						msg.nextFragmentNum++;
-						HandleOutOfSequenceFragment (msgID, msg);
+						HandleOutOfSequenceFragments (msgID, msg);
 					}	
 				}
 				else
 				{
-					LogPrint (eLogError, "Fragment ", m.nextFragmentNum, " of message ", msgID, "exceeds max I2NP message size. Message dropped");
-					i2p::DeleteI2NPMessage (msg.data);
+					LogPrint (eLogError, "TunnelMessage: Fragment ", m.nextFragmentNum, " of message ", msgID, "exceeds max I2NP message size, message dropped");
 					m_IncompleteMessages.erase (it);
 				}
-				i2p::DeleteI2NPMessage (m.data);
 			}
 			else
 			{	
-				LogPrint (eLogInfo, "Unexpected fragment ", (int)m.nextFragmentNum, " instead ", (int)msg.nextFragmentNum, " of message ", msgID, ". Saved");
+				LogPrint (eLogWarning, "TunnelMessage: Unexpected fragment ", (int)m.nextFragmentNum, " instead ", (int)msg.nextFragmentNum, " of message ", msgID, ", saved");
 				AddOutOfSequenceFragment (msgID, m.nextFragmentNum, isLastFragment, m.data);
 			}
 		}
 		else
 		{	
-			LogPrint (eLogInfo, "First fragment of message ", msgID, " not found. Saved");
+			LogPrint (eLogWarning, "TunnelMessage: First fragment of message ", msgID, " not found, saved");
 			AddOutOfSequenceFragment (msgID, m.nextFragmentNum, isLastFragment, m.data);
 		}	
 	}	
 
-	void TunnelEndpoint::AddOutOfSequenceFragment (uint32_t msgID, uint8_t fragmentNum, bool isLastFragment, I2NPMessage * data)
+	void TunnelEndpoint::AddOutOfSequenceFragment (uint32_t msgID, uint8_t fragmentNum, bool isLastFragment, std::shared_ptr<I2NPMessage> data)
 	{
-		auto it = m_OutOfSequenceFragments.find (msgID);
-		if (it == m_OutOfSequenceFragments.end ())
-			m_OutOfSequenceFragments.insert (std::pair<uint32_t, Fragment> (msgID, {fragmentNum, isLastFragment, data}));	
-		else
-			i2p::DeleteI2NPMessage (data);
+		if (!m_OutOfSequenceFragments.insert ({{msgID, fragmentNum}, {isLastFragment, data, i2p::util::GetMillisecondsSinceEpoch () }}).second)
+			LogPrint (eLogInfo, "TunnelMessage: duplicate out-of-sequence fragment ", fragmentNum, " of message ", msgID);
 	}	
 
-	void TunnelEndpoint::HandleOutOfSequenceFragment (uint32_t msgID, TunnelMessageBlockEx& msg)
+	void TunnelEndpoint::HandleOutOfSequenceFragments (uint32_t msgID, TunnelMessageBlockEx& msg)
 	{
-		auto it = m_OutOfSequenceFragments.find (msgID);
-		if (it != m_OutOfSequenceFragments.end ())
+		while (ConcatNextOutOfSequenceFragment (msgID, msg)) 
 		{
-			if (it->second.fragmentNum == msg.nextFragmentNum)
+			if (!msg.nextFragmentNum) // message complete
 			{
-				LogPrint (eLogInfo, "Out-of-sequence fragment ", (int)it->second.fragmentNum, " of message ", msgID, " found");
-				auto size = it->second.data->GetLength ();
-				if (msg.data->len + size > msg.data->maxLen)
-				{
-					LogPrint (eLogInfo, "Tunnel endpoint I2NP message size ", msg.data->maxLen, " is not enough");
-					I2NPMessage * newMsg = NewI2NPMessage ();
-					*newMsg = *(msg.data);
-					DeleteI2NPMessage (msg.data);
-					msg.data = newMsg;
-				}
-				memcpy (msg.data->buf + msg.data->len, it->second.data->GetBuffer (), size); // concatenate out-of-sync fragment
-				msg.data->len += size;
-				if (it->second.isLastFragment)
-				{
-					// message complete
-					HandleNextMessage (msg);	
-					m_IncompleteMessages.erase (msgID); 
-				}	
-				else
-					msg.nextFragmentNum++;
-				i2p::DeleteI2NPMessage (it->second.data);
-				m_OutOfSequenceFragments.erase (it);
-			}	
+				HandleNextMessage (msg);	
+				m_IncompleteMessages.erase (msgID);
+				break;
+			}
+		}
+	}
+
+	bool TunnelEndpoint::ConcatNextOutOfSequenceFragment (uint32_t msgID, TunnelMessageBlockEx& msg)
+	{
+		auto it = m_OutOfSequenceFragments.find ({msgID, msg.nextFragmentNum});
+		if (it != m_OutOfSequenceFragments.end ())
+		{					
+			LogPrint (eLogDebug, "TunnelMessage: Out-of-sequence fragment ", (int)msg.nextFragmentNum, " of message ", msgID, " found");
+			size_t size = it->second.data->GetLength ();
+			if (msg.data->len + size > msg.data->maxLen)
+			{
+				LogPrint (eLogWarning, "TunnelMessage: Tunnel endpoint I2NP message size ", msg.data->maxLen, " is not enough");
+				auto newMsg = NewI2NPMessage ();
+				*newMsg = *(msg.data);
+				msg.data = newMsg;
+			}
+			if (msg.data->Concat (it->second.data->GetBuffer (), size) < size) // concatenate out-of-sync fragment
+				LogPrint (eLogError, "TunnelMessage: Tunnel endpoint I2NP buffer overflow ", msg.data->maxLen);
+			if (it->second.isLastFragment)
+				// message complete
+				msg.nextFragmentNum = 0;
+			else
+				msg.nextFragmentNum++;
+			m_OutOfSequenceFragments.erase (it);
+			return true;		
 		}	
+		return false;
 	}	
 	
 	void TunnelEndpoint::HandleNextMessage (const TunnelMessageBlock& msg)
 	{
-		LogPrint (eLogInfo, "TunnelMessage: handle fragment of ", msg.data->GetLength ()," bytes. Msg type ", (int)msg.data->GetTypeID ());
+		if (!m_IsInbound && msg.data->IsExpired ())
+		{
+			LogPrint (eLogInfo, "TunnelMessage: message expired");
+			return;
+		}	
+		uint8_t typeID = msg.data->GetTypeID ();
+		LogPrint (eLogDebug, "TunnelMessage: handle fragment of ", msg.data->GetLength (), " bytes, msg type ", (int)typeID);
+		// catch RI or reply with new list of routers	
+		if ((IsRouterInfoMsg (msg.data) || typeID == eI2NPDatabaseSearchReply) &&
+			!m_IsInbound && msg.deliveryType != eDeliveryTypeLocal)
+			i2p::data::netdb.PostI2NPMsg (CopyI2NPMessage (msg.data));
+
 		switch (msg.deliveryType)
 		{
 			case eDeliveryTypeLocal:
 				i2p::HandleI2NPMessage (msg.data);
 			break;
 			case eDeliveryTypeTunnel:
-				i2p::transport::transports.SendMessage (msg.hash, i2p::CreateTunnelGatewayMsg (msg.tunnelID, msg.data));
-			break;
-			case eDeliveryTypeRouter:
-				if (msg.hash == i2p::context.GetRouterInfo ().GetIdentHash ()) // check if message is sent to us
-					i2p::HandleI2NPMessage (msg.data);
+				if (!m_IsInbound) // outbound transit tunnel
+					i2p::transport::transports.SendMessage (msg.hash, i2p::CreateTunnelGatewayMsg (msg.tunnelID, msg.data));
 				else
-				{	
-					// to somebody else
-					if (!m_IsInbound) // outbound transit tunnel
-					{
-						auto typeID = msg.data->GetTypeID ();
-						if (typeID == eI2NPDatabaseStore || typeID == eI2NPDatabaseSearchReply )
-						{
-							// catch RI or reply with new list of routers
-							auto ds = NewI2NPShortMessage ();
-							*ds = *(msg.data);
-							i2p::data::netdb.PostI2NPMsg (ds);
-						}
-						i2p::transport::transports.SendMessage (msg.hash, msg.data);
-					}
-					else // we shouldn't send this message. possible leakage 
-					{
-						LogPrint (eLogError, "Message to another router arrived from an inbound tunnel. Dropped");
-						i2p::DeleteI2NPMessage (msg.data);
-					}
-				}
+					LogPrint (eLogError, "TunnelMessage: Delivery type 'tunnel' arrived from an inbound tunnel, dropped");
+			break;
+			case eDeliveryTypeRouter:				
+				if (!m_IsInbound) // outbound transit tunnel
+					i2p::transport::transports.SendMessage (msg.hash, msg.data);
+				else // we shouldn't send this message. possible leakage 
+					LogPrint (eLogError, "TunnelMessage: Delivery type 'router' arrived from an inbound tunnel, dropped");
 			break;
 			default:
-			{	
 				LogPrint (eLogError, "TunnelMessage: Unknown delivery type ", (int)msg.deliveryType);
-				i2p::DeleteI2NPMessage (msg.data);
-			}	
 		};	
+	}
+
+	void TunnelEndpoint::Cleanup ()
+	{
+		auto ts = i2p::util::GetMillisecondsSinceEpoch ();
+		// out-of-sequence fragments
+		for (auto it = m_OutOfSequenceFragments.begin (); it != m_OutOfSequenceFragments.end ();)
+		{
+			if (ts > it->second.receiveTime + i2p::I2NP_MESSAGE_EXPIRATION_TIMEOUT)
+				it = m_OutOfSequenceFragments.erase (it);
+			else
+				++it;
+		}
+		// incomplete messages
+		for (auto it = m_IncompleteMessages.begin (); it != m_IncompleteMessages.end ();)
+		{
+			if (ts > it->second.receiveTime + i2p::I2NP_MESSAGE_EXPIRATION_TIMEOUT)
+				it = m_IncompleteMessages.erase (it);
+			else
+				++it;
+		}
 	}	
 }		
 }

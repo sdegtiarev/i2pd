@@ -4,6 +4,9 @@
 #ifdef USE_UPNP
 #include <string>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <memory>
 
 #include <miniupnpc/miniwget.h>
 #include <miniupnpc/miniupnpc.h>
@@ -12,14 +15,9 @@
 
 #include <boost/asio.hpp>
 
-#include "util.h"
-
-#define I2P_UPNP_TCP 1
-#define I2P_UPNP_UDP 2
-
 namespace i2p
 {
-namespace UPnP
+namespace transport
 {
 	class UPnP
 	{
@@ -32,13 +30,25 @@ namespace UPnP
         void Start ();
         void Stop ();
 
-		void Discover ();
-		void TryPortMapping (int type);
-		void CloseMapping (int type);
 	private:
-		void Run ();
 
-        std::thread * m_Thread;
+		void Discover ();
+		void PortMapping ();
+		void TryPortMapping (std::shared_ptr<i2p::data::RouterInfo::Address> address);
+		void CloseMapping ();
+		void CloseMapping (std::shared_ptr<i2p::data::RouterInfo::Address> address);
+
+		void Run ();
+		std::string GetProto (std::shared_ptr<i2p::data::RouterInfo::Address> address);
+
+	private:
+	
+		bool m_IsRunning;
+        std::unique_ptr<std::thread> m_Thread;
+		std::condition_variable m_Started;	
+		std::mutex m_StartedMutex;	
+		boost::asio::io_service m_Service;
+		boost::asio::deadline_timer m_Timer;	
         struct UPNPUrls m_upnpUrls;
         struct IGDdatas m_upnpData;
 
@@ -48,18 +58,22 @@ namespace UPnP
         struct UPNPDev * m_Devlist = 0;
         char m_NetworkAddr[64];
         char m_externalIPAddress[40];
-        bool m_IsModuleLoaded;
-        std::string m_Port = std::to_string (util::config::GetArg ("-port", 17070));
-#ifndef _WIN32
-        void *m_Module;
-#else
-        HINSTANCE *m_Module;
-#endif
 	};
-	extern UPnP upnpc;
 }
 }
 
-#endif
-
-#endif
+#else  // USE_UPNP
+namespace i2p {
+namespace transport {
+  /* class stub */
+  class UPnP {
+  public:
+    UPnP () {};
+    ~UPnP () {};
+    void Start () { LogPrint(eLogWarning, "UPnP: this module was disabled at compile-time"); }
+    void Stop () {};
+  };
+}
+}
+#endif // USE_UPNP
+#endif // __UPNP_H__

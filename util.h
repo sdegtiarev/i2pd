@@ -1,76 +1,127 @@
 #ifndef UTIL_H
 #define UTIL_H
 
-#include <map>
 #include <string>
-#include <iostream>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <boost/asio.hpp>
-#include <boost/filesystem.hpp>
-#include <boost/filesystem/fstream.hpp>
 
-#define PAIRTYPE(t1, t2)    std::pair<t1, t2>
+#ifdef ANDROID
+#include <boost/lexical_cast.hpp>
+namespace std
+{
+template <typename T>
+std::string to_string(T value)
+{
+   return boost::lexical_cast<std::string>(value);
+}
+
+inline int stoi(const std::string& str)
+{
+	return boost::lexical_cast<int>(str);
+}
+}
+#endif
 
 namespace i2p
 {
 namespace util
 {
-	namespace config
+
+	template<class T> 
+	class MemoryPool
 	{
-		extern std::map<std::string, std::string> mapArgs;
-		extern std::map<std::string, std::vector<std::string> > mapMultiArgs;
-		void OptionParser(int argc, const char* const argv[]);
-		int GetArg(const std::string& strArg, int nDefault);
-		std::string GetArg(const std::string& strArg, const std::string& strDefault);
-		const char* GetCharArg(const std::string& strArg, const std::string& nDefault);
-	}
+		public:
 
-	namespace filesystem
+			MemoryPool (): m_Head (nullptr) {};
+			~MemoryPool () 
+			{ 
+				while (m_Head) 
+				{
+					auto tmp = m_Head;
+					m_Head = static_cast<T*>(*(void * *)m_Head); // next
+					delete tmp;
+				}
+			} 
+
+			template<typename... TArgs>
+			T * Acquire (TArgs&&... args)
+			{
+				if (!m_Head) return new T(args...);
+				else
+				{
+					auto tmp = m_Head;
+					m_Head = static_cast<T*>(*(void * *)m_Head); // next
+					return new (tmp)T(args...);
+				}
+			}
+
+			void Release (T * t)
+			{
+				if (!t) return;
+				t->~T ();
+				*(void * *)t = m_Head; // next
+				m_Head = t;	
+			}
+
+			template<typename... TArgs>
+			std::unique_ptr<T, std::function<void(T*)> > AcquireUnique (TArgs&&... args)
+			{
+				return std::unique_ptr<T, std::function<void(T*)> >(Acquire (args...), 
+					std::bind (&MemoryPool<T>::Release, this, std::placeholders::_1));
+			}
+			
+			template<typename... TArgs>
+			std::shared_ptr<T> AcquireShared (TArgs&&... args)
+			{
+				return std::shared_ptr<T>(Acquire (args...), std::bind (&MemoryPool<T>::Release, this, std::placeholders::_1));
+			}
+
+		protected:
+
+			T * m_Head;
+	};	
+
+	template<class T>
+	class MemoryPoolMt: public MemoryPool<T>
 	{
-		void SetAppName (const std::string& name);
-		std::string GetAppName ();
+		public:
 
-		const boost::filesystem::path &GetDataDir();
-		std::string GetFullPath (const std::string& filename);	
-		boost::filesystem::path GetDefaultDataDir();
-		boost::filesystem::path GetConfigFile();
-		void ReadConfigFile(std::map<std::string, std::string>& mapSettingsRet,
-                std::map<std::string, std::vector<std::string> >& mapMultiSettingsRet);
-		boost::filesystem::path GetCertificatesDir();
-	}
+			MemoryPoolMt () {};			
+			template<typename... TArgs>
+			T * AcquireMt (TArgs&&... args)
+			{
+				if (!this->m_Head) return new T(args...);
+				std::lock_guard<std::mutex> l(m_Mutex);
+				return this->Acquire (args...);
+			}
 
-	namespace http
-	{
-		const char ETAG[] = "ETag";
-		const char IF_NONE_MATCH[] = "If-None-Match";
-		const char IF_MODIFIED_SINCE[] = "If-Modified-Since";
-		const char LAST_MODIFIED[] = "Last-Modified";
-		const char TRANSFER_ENCODING[] = "Transfer-Encoding";
+			void ReleaseMt (T * t)
+			{
+				std::lock_guard<std::mutex> l(m_Mutex);
+				this->Release (t);	
+			}
 
-		std::string httpRequest(const std::string& address);
-		std::string GetHttpContent (std::istream& response);
-		void MergeChunkedResponse (std::istream& response, std::ostream& merged);
-		int httpRequestViaI2pProxy(const std::string& address, std::string &content); // return http code
-		std::string urlDecode(const std::string& data);
+			template<template<typename, typename...>class C, typename... R>
+			void ReleaseMt(const C<T *, R...>& c)	
+			{
+				std::lock_guard<std::mutex> l(m_Mutex);
+				for (auto& it: c)
+					this->Release (it);
+			}	
+
+		private:
 		
-		struct url {
-    			url(const std::string& url_s); // omitted copy, ==, accessors, ...
-			private:
-    			void parse(const std::string& url_s);
-			public:
-				std::string protocol_, host_, path_, query_;
-				std::string portstr_;
-				unsigned int port_;
-				std::string user_;
-				std::string pass_;
-		};
-	}
+			std::mutex m_Mutex;
+	};
 
 	namespace net
 	{
 		int GetMTU (const boost::asio::ip::address& localAddress);
+		const boost::asio::ip::address GetInterfaceAddress(const std::string & ifname, bool ipv6=false);
 	}
 }
 }
-
 
 #endif

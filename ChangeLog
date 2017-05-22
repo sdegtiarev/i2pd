@@ -1,0 +1,173 @@
+# for this file format description,
+# see https://github.com/olivierlacan/keep-a-changelog
+
+## [2.13.0] - 2017-04-06
+### Added
+- Persist local destination's tags
+- GOST signature types 9 and 10
+- Exploratory tunnels configuration
+### Changed
+- Reseed servers list
+- Inactive NTCP sockets get closed faster
+- Some EdDSA speed up
+### Fixed
+- Multiple acceptors for SAM
+- Follow on data after STREAM CREATE for SAM
+- Memory leaks
+
+## [2.12.0] - 2017-02-14
+### Added
+- Additional HTTP and SOCKS proxy tunnels
+- Reseed from ZIP archive
+- Some stats in a main window for Windows version
+### Changed
+- Reseed servers list
+- MTU of 1488 for ipv6 
+- Android and Mac OS X versions use OpenSSL 1.1
+- New logo for Android
+### Fixed
+- Multiple memory leaks
+- Incomptibility of some EdDSA private keys with Java
+- Clock skew for Windows XP
+- Occasional crashes with I2PSnark
+
+## [2.11.0] - 2016-12-18
+### Added
+- Websockets support
+- Reseed through a floodfill
+- Tunnel configuration for HTTP and SOCKS proxy
+- Zero-hops tunnels for destinations
+- Multiple acceptors for SAM
+### Changed
+- Reseed servers list
+- DHT uses AVX if applicable
+- New logo
+- LeaseSet lookups
+### Fixed
+- HTTP Proxy connection reset for Windows
+- Crash upon SAM session termination
+- Can't connect to a destination for a longer time after restart
+- Mass packet loss for UDP tunnels
+
+## [2.10.2] - 2016-12-04
+### Fixed
+- Fixes UPnP discovery bug, producing excessive CPU usage
+- Fixes sudden SSU thread stop for Windows. 
+
+## [2.10.1] - 2016-11-07
+### Fixed
+- Fixed some performance issues for Windows and Android
+
+## [2.10.0] - 2016-10-17
+### Added
+- Datagram i2p tunnels
+- Unique local addresses for server tunnels
+- Configurable list of reseed servers  and initial addressbook
+- Configurable netid
+- Initial iOS support
+
+### Changed
+- Reduced file descriptiors usage
+- Strict reseed checks enabled by default
+
+## Fixed
+- Multiple fixes in I2CP and BOB implementations
+
+## [2.9.0] - 2016-08-12
+### Changed
+- Proxy refactoring & speedup
+- Transmission-I2P support
+- Graceful shutdown for Windows
+- Android without QT
+- Reduced number of timers in SSU
+- ipv6 peer test support
+- Reseed from SU3 file
+
+## [2.8.0] - 2016-06-20
+### Added
+- Basic Android support
+- I2CP implementation
+- 'doxygen' target
+
+### Changed
+- I2PControl refactoring & fixes (proper jsonrpc responses on errors)
+- boost::regex no more needed
+
+### Fixed
+- initscripts: added openrc one, in sysv-ish make I2PD_PORT optional
+- properly close NTCP sessions (memleak)
+
+## [2.7.0] - 2016-05-18
+### Added
+- Precomputed El-Gamal/DH tables
+- Configurable limit of transit tunnels
+
+### Changed
+- Speed-up of assymetric crypto for non-x64 platforms
+- Refactoring of web-console
+
+## [2.6.0] - 2016-03-31
+### Added
+- Gracefull shutdown on SIGINT
+- Numeric bandwidth limits (was: by router class)
+- Jumpservices in web-console
+- Logging to syslog
+- Tray icon for windows application
+
+### Changed
+- Logs refactoring
+- Improved statistics in web-console
+
+### Deprecated:
+- Renamed main/tunnels config files (will use old, if found, but emits warning)
+
+## [2.5.1] - 2016-03-10
+### Fixed
+- Doesn't create ~/.i2pd dir if missing
+
+## [2.5.0] - 2016-03-04
+### Added
+- IRC server tunnels
+- SOCKS outproxy support
+- Support for gzipped addressbook updates
+- Support for router families
+
+### Changed
+- Shared RTT/RTO between streams
+- Filesystem work refactoring
+
+## [2.4.0] - 2016-02-03
+### Added
+- X-I2P-* headers for server http-tunnels
+- I2CP options for I2P tunnels
+- Show I2P tunnels in webconsole
+
+### Changed
+- Refactoring of cmdline/config parsing
+
+## [2.3.0] - 2016-01-12
+### Added
+- Support for new router bandwidth class codes (P and X)
+- I2PControl supports external webui
+- Added --pidfile and --notransit parameters
+- Ability to specify signature type for i2p tunnel
+
+### Changed
+- Fixed multiple floodfill-related bugs
+- New webconsole layout
+
+## [2.2.0] - 2015-12-22
+### Added
+- Ability to connect to router without ip via introducer
+
+### Changed
+- Persist temporary encryption keys for local destinations
+- Performance improvements for EdDSA
+- New addressbook structure
+
+## [2.1.0] - 2015-11-12
+### Added
+- Implementation of EdDSA
+
+### Changed
+- EdDSA is default signature type for new RouterInfos
